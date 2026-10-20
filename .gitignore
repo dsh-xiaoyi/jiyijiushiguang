@@ -1,0 +1,50 @@
+# Never commit secrets, local state, or data. tools/scrub-audit.ps1 enforces this too.
+
+# --- secrets & credentials ---
+.credentials.yaml
+*.token
+*token*.txt
+bridge-peers.json
+peers.json
+config.json
+secrets.json
+*.pfx
+*.pem
+id_rsa*
+id_ed25519*
+ssh-keys/
+
+# --- local runtime state ---
+logs/
+*.log
+*.jsonl
+_inbox/
+_outbox/
+bak/
+*.bak
+*.bak-before-*
+*.bak-*
+
+# --- data (never publish) ---
+data/
+exports/
+memories*.json
+*.sqlite
+*.db
+*.mdf
+*.ldf
+*.bak
+
+# --- toolchain ---
+node_modules/
+.pnpm-store/
+dist/
+build/
+.venv/
+
+# --- editors / OS ---
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
