@@ -1,7 +1,7 @@
 # MySQL 版验收报告（2026-10-24）
 
 > 对象：`记忆旧时光 · MySQL 版`（`provider = mysql`，后端走 `mysql.exe`，零 DLL 依赖）
-> 测试环境：**MySQL 8.0.12 / Windows 7 SP1 / 库名 dsh_memory**（10.0.0.1）
+> 测试环境：**MySQL 8.0.12 / Windows 7 SP1 / 库名 dsh_memory**（测试机 · 内网地址不写死）
 > 结论先放前面：**"记忆读写"这条线完整可用；"会话导入（sync）"还没移植 —— 建议先发 beta，或补齐 sync 再发正式版。**
 
 ## 一、验收矩阵（15 个命令）
