@@ -29,7 +29,7 @@
 - [ ] 备份：`mysqldump` / `mysql < file`
 - [x] 建表验证：MySQL 8.0.12（Win7 测试机）10 表 + 6 触发器全部建成
 - [x] 端到端：save/search/replica + 插件注入 verify.mjs **PASS**
-- [ ] **sync（会话导入）移植** —— SqlBulkCopy 无 MySQL 等价物，需改行级写入；见 docs/11
+- [x] **sync（会话导入）移植** —— 单次调用内完成临时表→归档→更新→插入→删除；实测 267 行导入、幂等
 - [ ] 文档：MySQL 版 README（建库授权、字符集 utf8mb4、时区）
 
 ## v0.4.0 — 检索升级（可选）
