@@ -18,6 +18,7 @@
 | `dsh-mem.ps1` | 引擎 CLI：save / search / recent / sync / backup / replica / history |
 | `mem-artifact.ps1` | 把文件登记成"工件"（入库 + 哈希校验） |
 | `conventions.example.md` | 关键约定模板（复制成 `conventions.md` 再按自己情况改） |
+| `dsh-zstd-extract.js` | 会话日志解压（DSH 用多帧 zstd；需 Node 22.15+/23+） |
 | `plugin/index.mjs` | 注入插件：每轮把"强制指令 + 相关旧记忆 + 关键约定 + 定义型记忆"放进上下文 |
 | `plugin/verify.mjs` | 插件自检：副本路径、注入是否真的发生 |
 | `plugin/package.json` / `cordis.patch.yml` | 插件声明与 DSH 配置片段 |
@@ -28,7 +29,7 @@
 |---|---|
 | `sql/sqlserver/` | ✅ 当前版本（13 个脚本，按编号执行） |
 | `sql/sqlite/` | ⏳ 计划中（v0.2.0） |
-| `sql/mysql/` | ⏳ 计划中（v0.3.0） |
+| `sql/mysql/` | ✅ MySQL 8.0 方言（10 表 + 6 触发器，已在 8.0.12 实测） |
 
 ## `ops/` —— 工具
 
