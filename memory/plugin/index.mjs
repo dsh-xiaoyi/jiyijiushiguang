@@ -161,7 +161,8 @@ export function apply(ctx, config) {
   // AUTO-RECALL 2026-10-23: 从副本里读"最近真正说过的话"，去记忆库做关键词检索，注入相关旧约定
   const autoRecall   = config.autoRecall === false ? false : true
   const recallTop    = Number(config.recallTop || 4)
-  const maxChars    = Number(config.maxChars || 2400)
+  const maxChars    = Number(config.maxChars || 12000)   // 2026-10-24: 2400 太小，会把活动段/定义型记忆整段截掉
+  const conventionsMax = Number(config.conventionsMax || 3000) // 关键约定单独设上限，避免挤掉后面的段落
   const refreshMs   = Number(config.refreshMs || 60000)
   const heading     = config.heading || '共享长期记忆（三台机器共用）'
   const activity    = config.activity !== false
@@ -298,6 +299,9 @@ export function apply(ctx, config) {
       try {
         if (conventionsPath && existsSync(conventionsPath)) {
           let conv = readFileSync(conventionsPath, 'utf8')
+      if (conv.length > conventionsMax) {
+        conv = conv.slice(0, conventionsMax) + '\n…（关键约定已截断，完整内容见 ' + conventionsPath + '）'
+      }
           if (conv.charCodeAt(0) === 0xFEFF) conv = conv.slice(1)
           conv = conv.trim()
           if (conv) {

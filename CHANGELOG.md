@@ -11,6 +11,20 @@
 - `Register-Host`：MySQL 分支用 `CURRENT_USER()` + 本机名做 upsert
 - `replica`：真的按配置的 `replicaPath` 落盘（之前硬编码在脚本旁边，与文档不符）
 
+### 备份与端到端（2026-10-24）
+- `backup`：MySQL 分支用 `mysqldump`（`--single-transaction --routines --triggers`），
+  实测在 8.0.12 上产出 19.7KB dump，含 10 张表与全部触发器；`mysqldumpCliPath` 可配置
+- 导出与副本的默认位置改为**配置目录**（之前落在脚本/仓库目录，正是副本文件误入仓库的根因）
+- 修 `CONVERT(...)+'Z'` 的 MySQL 语义：MySQL 里 `+` 是数值加法，`'2026-10-23T…' + 'Z'` 会变成 `2026`
+  ⇒ 现在翻译为 `CONCAT(DATE_FORMAT(...),'Z')`（实测踩过，副本里时间一度只剩年份）
+
+### 注入截断修复（影响生产，值得单独记）
+- 插件默认 `maxChars=2400`，而「关键约定」全文 6.5KB ⇒ 截断把**各机活动、定义型记忆整段切掉**，
+  生产环境里看到的注入其实一直是被截断的
+- 现在：`conventionsMax=3000`（关键约定单独设上限并给出"已截断"提示）、`maxChars=12000`
+- 用插件自带 `verify.mjs` 对 MySQL 产出的副本跑端到端：**RESULT: PASS**
+  （活动段 1 台机器、时间 18:28 UTC 正确、ISO-8601 无需时区补偿、capture/llm 记账均通过）
+
 ### 实测（2026-10-24 · MySQL 8.0.12）
 - `save` / `search` / `recent` / `roster` / `replica` 全部跑通
 - `roster` 显示 `dsh@% | <机器名> | CLI 1.3.4`，与 SQL Server 版一致

@@ -174,7 +174,7 @@ $script:Db          = $cfg.database
 $script:CsBase      = "Server=$($cfg.server);User Id=$($cfg.user);Password=$($cfg.password);TrustServerCertificate=True;Connect Timeout=20"
 $script:StatePath   = Join-Path $Root 'dsh-mem-state.json'
 # 副本路径：配置里写了就用配置的（文档承诺过），否则默认放在脚本旁边
-$script:ReplicaPath = if ($cfg.replicaPath) { [string]$cfg.replicaPath } else { Join-Path $Root 'dsh-mem-replica.json' }
+$script:ReplicaPath = if ($cfg.replicaPath) { [string]$cfg.replicaPath } else { Join-Path (Split-Path -Parent $CfgPath) 'dsh-mem-replica.json' }
 $script:ReplicaError = ''
 $script:RedactList  = @()
 if ($cfg.redact) { $script:RedactList = @($cfg.redact) }
@@ -230,6 +230,9 @@ function ConvertTo-MySqlSql {
   $s = [regex]::Replace($s, '(?i)\bHOST_NAME\s*\(\s*\)', (ConvertTo-MySqlLiteral $env:COMPUTERNAME))
   # CONVERT(varchar(33), X, 126) → DATE_FORMAT(X,'%Y-%m-%dT%H:%i:%s')
   $s = [regex]::Replace($s, '(?is)CONVERT\s*\(\s*varchar\s*\(\s*\d+\s*\)\s*,\s*(.+?)\s*,\s*126\s*\)', "DATE_FORMAT(`$1, '%Y-%m-%dT%H:%i:%s')")
+  # ★ MySQL 的 + 是数值加法：'2026-10-23T…' + 'Z' 会变成 2026（不是拼接！）。
+  #   所以 SQL Server 的 CONVERT(...)+'Z' 必须包成 CONCAT(...)。这个坑实测踩过。
+  $s = [regex]::Replace($s, "(?is)(DATE_FORMAT\s*\([^()]*\))\s*\+\s*'Z'", "CONCAT(`$1, 'Z')")
   # N'...' → '...'
   $s = [regex]::Replace($s, "(?i)\bN'", "'")
   # TOP (n) → LIMIT n（挪到语句末尾）
@@ -1982,6 +1985,34 @@ foreach ($r in @($mem)) {
     $stamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
     # 备份目录：优先环境变量 DSH_BACKUP_DIR，其次 <配置目录>\backup（不再写死某台机器的盘符）
     $bakDir = if ($env:DSH_BACKUP_DIR) { $env:DSH_BACKUP_DIR } else { Join-Path (Split-Path $ConfigPath -Parent) 'backup' }
+    if ($script:Provider -eq 'mysql') {
+      $bak = Join-Path $bakDir ("dsh_memory_" + $stamp + ".sql")
+      $dumpCli = if ($cfg.mysqldumpCliPath) { [string]$cfg.mysqldumpCliPath } else { 'mysqldump' }
+      try {
+        if (-not (Test-Path -LiteralPath $bakDir)) { New-Item -ItemType Directory -Path $bakDir -Force | Out-Null }
+        $cnf = [System.IO.Path]::GetTempFileName()
+        try {
+          $lines = @('[client]',
+                     ('user=' + [string]$cfg.user),
+                     ('password=' + [string]$cfg.password),
+                     ('host=' + ([string]$cfg.server).Split(',')[0]),
+                     'port=3306')
+          if (([string]$cfg.server) -match ',\s*(\d+)\s*$') { $lines[4] = 'port=' + $matches[1] }
+          [System.IO.File]::WriteAllText($cnf, ($lines -join "`r`n"), (New-Object System.Text.ASCIIEncoding))
+          $dumpArgs = @(('--defaults-extra-file=' + $cnf),
+                        '--single-transaction', '--routines', '--triggers', '--no-tablespaces',
+                        '--set-gtid-purged=OFF', '--default-character-set=utf8mb4',
+                        ('--result-file=' + $bak), $script:Db)
+          $null = & $dumpCli @dumpArgs 2>&1
+          if ($LASTEXITCODE -ne 0) { throw ('mysqldump exit ' + $LASTEXITCODE) }
+          $kb = [math]::Round((Get-Item -LiteralPath $bak).Length / 1KB, 1)
+          Write-Host ("  OK  full dump -> " + $bak + "  (" + $kb + " KB)")
+        } finally { Remove-Item -LiteralPath $cnf -Force -ErrorAction SilentlyContinue }
+      } catch {
+        Write-Host ("  WARN full dump skipped: " + $_.Exception.Message)
+        Write-Host ("       （需要 mysqldump 在 PATH，或配置 mysqldumpCliPath）")
+      }
+    } else {
     $bak    = Join-Path $bakDir ("DSHMemory_" + $stamp + ".bak")
     try {
       [void](Invoke-Exec -Sql "BACKUP DATABASE [$script:Db] TO DISK = N'$bak' WITH INIT, COMPRESSION, CHECKSUM, STATS = 25" -Db 'master')
@@ -1994,6 +2025,7 @@ foreach ($r in @($mem)) {
     } catch {
       Write-Host ("  WARN full backup skipped: " + $_.Exception.Message)
     }
+    }
     $rows = Invoke-Rows -Sql "SELECT id, scope, subject, kind, title, body, tags, source_session, confidence, created_at, updated_at FROM dbo.memories ORDER BY id"
     # redact per field, then check the serialised result before it reaches the disk
 foreach ($r in @($rows)) {
@@ -2005,14 +2037,14 @@ foreach ($r in @($rows)) {
     $r.title = Protect-Text ([string]$r.title); $r.body = Protect-Text ([string]$r.body)
   }
 }
-    $out  = Join-Path $Root ("memories-backup-" + $stamp + ".json")
+    $out  = Join-Path $bakDir ("memories-backup-" + $stamp + ".json")
     $json = $rows | ConvertTo-Json -Depth 5
     $hits = Get-SecretHitCount $json
     Set-Content -LiteralPath $out -Value $json -Encoding UTF8
     Write-Host ("  OK  memories export (" + @($rows).Count + " rows) -> " + $out)
     Write-ExportNote $out 'the memories export' $hits
     # keep the 30 newest JSON exports
-    Get-ChildItem -LiteralPath $Root -Filter 'memories-backup-*.json' -ErrorAction SilentlyContinue |
+    Get-ChildItem -LiteralPath $bakDir -Filter 'memories-backup-*.json' -ErrorAction SilentlyContinue |
       Sort-Object LastWriteTime -Descending | Select-Object -Skip 30 |
       ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
   }
