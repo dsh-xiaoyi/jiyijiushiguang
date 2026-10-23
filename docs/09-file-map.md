@@ -47,6 +47,8 @@
 | `02-memory-design.md` | 注入四段、为什么必须 IDF、三层缺陷复盘 |
 | `04-postmortems.md` | 真实事故与修法 |
 | `08-permissions-and-antivirus.md` | 权限要求 + 安全软件拦截怎么处理 |
+| `11-mysql-acceptance.md` | MySQL 版验收矩阵与限制 |
+| `12-mysql-security.md` | MySQL 部署的安全注意事项（账号/端口/备份/字符集） |
 | `ROADMAP.md` | 接下来做什么 |
 | `09-file-map.md` | 本页 |
 

@@ -97,6 +97,8 @@ done
 mysql --defaults-extra-file=my.cnf -t dsh_memory < sql/mysql/009-verify.sql
 ```
 
+> ⚠ 安全：账号、端口、备份、字符集这几件事请先看 [docs/12-mysql-security](docs/12-mysql-security.md)。
+
 实测环境：**MySQL 8.0.12（Windows）**，10 张表 + 6 个只追加触发器全部建成；
 `UPDATE/DELETE messages` 会被触发器拦住（SQLSTATE 45000），`UPDATE memories` 正常放行。
 
