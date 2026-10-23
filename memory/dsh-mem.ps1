@@ -397,6 +397,22 @@ function Test-DbAlive {
   try {
     if ($script:Provider -eq 'mysql') {
       $null = Invoke-MySqlCli -Sql 'SELECT 1' -Db $script:Db
+      # 版本自查（每进程一次）：DATETIME(3) 需要 5.6.4+，低于此版本会静默丢毫秒
+      if (-not $script:MySqlVersionChecked) {
+        $script:MySqlVersionChecked = $true
+        try {
+          $vOut = @(Invoke-MySqlCli -Sql 'SELECT VERSION()' -Db $script:Db | Where-Object { $_ -and $_ -notmatch 'VERSION' })
+          if ($vOut.Count -gt 0) {
+            $raw = [string]$vOut[-1]
+            if ($raw -match '(\d+)\.(\d+)\.(\d+)') {
+              $ver = [version]($matches[1] + '.' + $matches[2] + '.' + $matches[3])
+              if ($ver -lt [version]'5.6.4') {
+                Write-Host ("  WARN: MySQL " + $raw + " is older than 5.6.4 -- DATETIME(3) is not supported (timestamps lose milliseconds)")
+              }
+            }
+          }
+        } catch { }
+      }
       return $true
     }
     $cn = New-Object System.Data.SqlClient.SqlConnection ("Server=$($cfg.server);Database=$($script:Db);User Id=$($cfg.user);Password=$($cfg.password);TrustServerCertificate=True;Connect Timeout=3")

@@ -7,7 +7,8 @@
 
 ```sql
 -- 正确做法：一个库、一个专用账号、只给这个库的权限
-CREATE USER 'dsh'@'%' IDENTIFIED WITH mysql_native_password BY '强口令';
+CREATE USER 'dsh'@'%' IDENTIFIED WITH mysql_native_password BY '强口令';  -- ≤8.3 用这个
+-- 8.4+ 该插件默认禁用：改成 CREATE USER 'dsh'@'%' IDENTIFIED BY '强口令';（用默认 caching_sha2_password）
 GRANT ALL PRIVILEGES ON dsh_memory.* TO 'dsh'@'%';
 FLUSH PRIVILEGES;
 ```

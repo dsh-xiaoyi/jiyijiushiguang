@@ -49,6 +49,7 @@
 | `08-permissions-and-antivirus.md` | 权限要求 + 安全软件拦截怎么处理 |
 | `11-mysql-acceptance.md` | MySQL 版验收矩阵与限制 |
 | `12-mysql-security.md` | MySQL 部署的安全注意事项（账号/端口/备份/字符集） |
+| `13-mysql-compatibility.md` | MySQL/MariaDB 版本兼容矩阵与差异改法 |
 | `ROADMAP.md` | 接下来做什么 |
 | `09-file-map.md` | 本页 |
 

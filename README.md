@@ -80,11 +80,18 @@ powershell -File memory\dsh-mem.ps1 search 记忆
 
 ## MySQL 版怎么装（v0.2.0 · 建表已验证）
 
+```
+版本要求：MySQL 5.6.4+（推荐 5.7 / 8.0；8.4+ 见下方"认证插件"一行）
+实测环境：MySQL 8.0.12 / Windows。MariaDB 理论可用但未测。
+细节见 docs/13-mysql-compatibility.md
+```
+
 ```bash
 # 1) 建库（utf8mb4 必须显式）
-mysql -uroot -p -e "CREATE DATABASE dsh_memory CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
+mysql -uroot -p -e "CREATE DATABASE dsh_memory CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
 
 # 2) 建账号（只给这个库的权限）
+#    认证插件按你的版本选：≤8.3 用 mysql_native_password；8.4+ 默认禁用该插件，去掉 IDENTIFIED WITH 让它用默认插件
 mysql -uroot -p -e "CREATE USER 'dsh'@'%' IDENTIFIED WITH mysql_native_password BY '你的强口令';
                     GRANT ALL PRIVILEGES ON dsh_memory.* TO 'dsh'@'%'; FLUSH PRIVILEGES;"
 

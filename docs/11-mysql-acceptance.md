@@ -68,7 +68,7 @@
 ## 六、复现步骤（任何人可重跑）
 
 ```bash
-mysql -uroot -p -e "CREATE DATABASE dsh_memory CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
+mysql -uroot -p -e "CREATE DATABASE dsh_memory CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
 for f in sql/mysql/0*.sql; do mysql --defaults-extra-file=my.cnf --init-command="SET time_zone='+00:00'" dsh_memory < "$f"; done
 
 # 配置里 provider=mysql + mysqlCliPath 指向 mysql.exe
