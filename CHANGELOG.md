@@ -11,6 +11,12 @@
 - `Register-Host`：MySQL 分支用 `CURRENT_USER()` + 本机名做 upsert
 - `replica`：真的按配置的 `replicaPath` 落盘（之前硬编码在脚本旁边，与文档不符）
 
+### sync 移植（2026-10-24 · v0.2.0 的最后一块）
+- MySQL 版 `sync`（会话导入）完成：单次调用内 建临时表 → 归档 → 更新 → 插入 → 删除，并回报 5 个计数
+- 只追加触发器加"维护模式"开关（`SET @dsh_allow_mutation = 1`），比 DROP/CREATE 触发器安全（变量随连接消失）
+- 实测：337 帧 / 1.6MB → 267 行；重复跑自动 skip；`-Force` 重跑 inserted=0 updated=0 removed=0
+- 过程中修掉 3 个坑：`--init-command` 经 cmd 必须整体加引号、临时表必须显式 COLLATE、`TOP n` 两种写法
+
 ### 验收（2026-10-24）
 - 验收报告：`docs/11-mysql-acceptance.md`（命令矩阵 + 5 个已修问题 + 限制）
 - 结论：记忆读写链路（save/search/recent/history/secrets/stats/roster/replica/backup）**全部通过**；

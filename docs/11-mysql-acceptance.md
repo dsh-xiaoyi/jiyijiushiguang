@@ -2,7 +2,7 @@
 
 > 对象：`记忆旧时光 · MySQL 版`（`provider = mysql`，后端走 `mysql.exe`，零 DLL 依赖）
 > 测试环境：**MySQL 8.0.12 / Windows 7 SP1 / 库名 dsh_memory**（测试机 · 内网地址不写死）
-> 结论先放前面：**"记忆读写"这条线完整可用；"会话导入（sync）"还没移植 —— 建议先发 beta，或补齐 sync 再发正式版。**
+> 结论：**15 个命令中 11 个通过、4 个未测（handoff / prune / embed / recall），没有阻塞项 —— 可以发正式版 v0.2.0。**
 
 ## 一、验收矩阵（15 个命令）
 
@@ -18,10 +18,10 @@
 | `roster` | ✅ | `dsh@% \| <机器名> \| CLI 1.3.4`，与 SQL Server 版一致 |
 | `replica` | ✅ | 生成副本 JSON；插件 `verify.mjs` 端到端 **PASS**（活动段 4 台机器、UTC 时间正确） |
 | `backup` | ✅ | `mysqldump` 产出 19.7KB dump，含 10 张表 + 6 个触发器 |
-| `handoff` | ⚠ 未测 | 需要跨机会话数据；逻辑只读 messages |
+| `handoff` | ⚠ 未测 | 只读 `messages`，逻辑与 SQL Server 版一致；未在测试库上验证输出格式 |
 | `prune` | ⚠ 未测 | 会删历史归档，属不可逆操作，**没有在测试库上跑** |
 | `embed` / `recall` | ⚠ 未测 | 需要配置 `embed` 块（语义检索，可选功能） |
-| `sync` | ❌ **未移植** | 解压环节 OK（2 帧/0 坏帧），写库环节失败：SQL Server 侧用的是 `SqlBulkCopy`，MySQL 没有等价物 |
+| `sync` | ✅ | 真实会话导入：337 帧 / 1.6MB 文本 → imported user=14 assistant=69 tool=184 total=267；库内 messages=269；再跑 skip unchanged；`-Force` 重跑 **inserted=0 updated=0 removed=0**（幂等）|
 
 ## 二、建表脚本验收（`sql/mysql/`）
 
@@ -45,8 +45,7 @@
 ## 四、已知限制（照实写）
 
 ```
-· sync 未移植（最大的一个）：会话日志暂时导不进 MySQL 库
-  → 直接影响："记住全部对话"这条能力用不了；save/search/replica/backup 不受影响
+· `handoff` / `prune` / `embed` / `recall` 未在 MySQL 上验证（前两个是读/删历史，后两个要 embed 配置）
 · 触发器需要 log_bin_trust_function_creators=1（或 SUPER），见 sql/mysql/007 头部
 · 每次查询起一个 mysql.exe 进程（~50-100ms）；对"每轮几次查询"够用，但不适合高频批量
 · embed/recall（语义检索）未验证；向量表结构已建
@@ -73,4 +72,24 @@ powershell -File memory\dsh-mem.ps1 search 测试
 powershell -File memory\dsh-mem.ps1 stats
 powershell -File memory\dsh-mem.ps1 backup
 node memory\plugin\verify.mjs        # 端到端注入自检，应 RESULT: PASS
+```
+
+## 七、sync（会话导入）在 MySQL 上的实现（2026-10-24 补齐）
+
+```
+SQL Server 用 #临时表 + SqlBulkCopy；MySQL 没有等价物，而且 mysql.exe **每次调用都是新连接**，
+所以整个写作阶段放进**一次**调用：
+  建临时表（显式 COLLATE=utf8mb4_general_ci，否则字符串比较报 1267）
+  → 分批 INSERT 灌数据（每 100 行一条 INSERT）
+  → 归档 dropped/changed 到 messages_history
+  → UPDATE 变更行 → INSERT 新行 → DELETE 已消失的 seq
+  → SELECT 五个计数（dropped/changed/inserted/updated/removed）
+
+只追加触发器怎么兼容？
+  触发器里加了维护开关：默认 `@dsh_allow_mutation IS NULL` ⇒ 拦；
+  sync 的脚本开头 `SET @dsh_allow_mutation = 1;` ⇒ 放行。
+  变量随连接消失，所以不存在"忘了恢复"的风险（比 DROP TRIGGER 更安全）。
+
+实测（2026-10-24）：
+  337 帧 / 1.6MB 文本 → 267 行；重复跑 skip；-Force 重跑 inserted=0 updated=0 removed=0
 ```

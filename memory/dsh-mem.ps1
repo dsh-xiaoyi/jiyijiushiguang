@@ -284,6 +284,37 @@ function Invoke-MySqlCli {
   } finally { Remove-Item -LiteralPath $cnf -Force -ErrorAction SilentlyContinue }
 }
 
+function Invoke-MySqlScript {
+  # 大脚本走 stdin（命令行有长度上限，sync 一次可能几 MB）
+  param([string]$Sql, [string]$Db)
+  if (-not $Db) { $Db = $script:Db }
+  # 经 cmd.exe 传递时必须整体加双引号，否则空格会把参数切成两半（实测：mysql 直接打印 usage）
+  $tzInit = '--init-command=' + [char]34 + 'SET time_zone=' + [char]39 + '+00:00' + [char]39 + [char]34
+  $cnf = [System.IO.Path]::GetTempFileName()
+  $sqlf = [System.IO.Path]::GetTempFileName()
+  try {
+    $lines = @('[client]',
+               ('user=' + [string]$cfg.user),
+               ('password=' + [string]$cfg.password),
+               ('host=' + ([string]$cfg.server).Split(',')[0]),
+               'port=3306',
+               'connect-timeout=20')
+    if (([string]$cfg.server) -match ',\s*(\d+)\s*$') { $lines[4] = 'port=' + $matches[1] }
+    [System.IO.File]::WriteAllText($cnf, ($lines -join "`r`n"), (New-Object System.Text.ASCIIEncoding))
+    [System.IO.File]::WriteAllText($sqlf, $Sql, (New-Object System.Text.UTF8Encoding $false))
+    $argLine = ('--defaults-extra-file="' + $cnf + '" --batch --default-character-set=utf8mb4 ' +
+                $tzInit + ' ' + $Db + ' < "' + $sqlf + '"')
+    $out = & cmd.exe /c ('"' + $script:MySqlCliPath + '" ' + $argLine + ' 2>&1')
+    if ($LASTEXITCODE -ne 0) {
+      $msg = (@($out) | Where-Object { $_ -and ($_ -notmatch 'Using a password') }) -join ' | '
+      throw ('mysql script error ' + $LASTEXITCODE + ': ' + $msg)
+    }
+    return @($out)
+  } finally {
+    Remove-Item -LiteralPath $cnf, $sqlf -Force -ErrorAction SilentlyContinue
+  }
+}
+
 function ConvertTo-MySqlRows {
   param([string[]]$RawLines)
   $lines = @($RawLines | Where-Object { $_ -ne $null })
@@ -647,6 +678,72 @@ function Invoke-Sync {
   if ($SkipArchive) {
     Write-Host "  WARNING: -SkipArchive is set -- rows the log no longer has will be deleted WITHOUT a copy" -ForegroundColor Yellow
   }
+  if ($script:Provider -eq 'mysql') {
+    # MySQL 没有 SqlBulkCopy / 临时表跨连接不存在 ⇒ 整个写作阶段放进**一次** mysql.exe 调用：
+    # 建临时表 → 灌数据 → 归档 → 更新 → 插入 → 删除 → 回报计数。
+    # 只追加触发器允许维护模式：脚本开头 SET @dsh_allow_mutation = 1（见 sql/mysql/007）。
+    $by = [string]$env:COMPUTERNAME
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('SET @dsh_allow_mutation = 1;')
+    [void]$sb.AppendLine('DROP TEMPORARY TABLE IF EXISTS _dsh_incoming;')
+    [void]$sb.AppendLine('CREATE TEMPORARY TABLE _dsh_incoming (seq BIGINT NOT NULL, turn INT NULL, role VARCHAR(24) NOT NULL, text LONGTEXT NULL, created_at DATETIME(3) NOT NULL, KEY (seq)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;')
+    $batch = New-Object System.Collections.Generic.List[string]
+    foreach ($row in $dt.Rows) {
+      $seqLit = [string][int64]$row.seq
+      $turnLit = 'NULL'
+      if ($null -ne $row.turn -and [string]$row.turn -ne '') { $turnLit = [string][int]$row.turn }
+      $batch.Add('(' + $seqLit + ',' + $turnLit + ',' + (ConvertTo-MySqlLiteral ([string]$row.role)) + ',' +
+                 (ConvertTo-MySqlLiteral ([string]$row.text)) + ',' + (ConvertTo-MySqlLiteral ([datetime]$row.created_at)) + ')')
+      if ($batch.Count -ge 100) {
+        [void]$sb.AppendLine('INSERT INTO _dsh_incoming VALUES ' + ($batch -join ',') + ';')
+        $batch.Clear()
+      }
+    }
+    if ($batch.Count -gt 0) { [void]$sb.AppendLine('INSERT INTO _dsh_incoming VALUES ' + ($batch -join ',') + ';') }
+    [void]$sb.AppendLine('SET @sid = ' + (ConvertTo-MySqlLiteral $sid) + ';')
+    [void]$sb.AppendLine('SET @by = ' + (ConvertTo-MySqlLiteral $by) + ';')
+    [void]$sb.AppendLine(@"
+SET @dropped = (SELECT COUNT(*) FROM messages m LEFT JOIN _dsh_incoming i ON i.seq = m.seq WHERE m.session_id = @sid AND i.seq IS NULL);
+SET @changed = (SELECT COUNT(*) FROM messages m JOIN _dsh_incoming i ON i.seq = m.seq
+   WHERE m.session_id = @sid AND (MD5(IFNULL(m.text,'')) <> MD5(IFNULL(i.text,'')) OR IFNULL(m.role,'') <> IFNULL(i.role,'') OR IFNULL(m.turn,-1) <> IFNULL(i.turn,-1)));
+INSERT INTO messages_history (id, session_id, seq, turn, role, text, created_at, archive_reason, archived_by)
+SELECT m.id, m.session_id, m.seq, m.turn, m.role, m.text, m.created_at,
+       CASE WHEN i.seq IS NULL THEN 'dropped' ELSE 'changed' END, @by
+FROM messages m LEFT JOIN _dsh_incoming i ON i.seq = m.seq
+WHERE m.session_id = @sid
+  AND (i.seq IS NULL OR MD5(IFNULL(m.text,'')) <> MD5(IFNULL(i.text,'')) OR IFNULL(m.role,'') <> IFNULL(i.role,'') OR IFNULL(m.turn,-1) <> IFNULL(i.turn,-1));
+UPDATE messages m JOIN _dsh_incoming i ON i.seq = m.seq
+   SET m.turn = i.turn, m.role = i.role, m.text = i.text, m.created_at = i.created_at
+WHERE m.session_id = @sid
+  AND (MD5(IFNULL(m.text,'')) <> MD5(IFNULL(i.text,'')) OR IFNULL(m.role,'') <> IFNULL(i.role,'') OR IFNULL(m.turn,-1) <> IFNULL(i.turn,-1));
+SET @upd = ROW_COUNT();
+INSERT INTO messages (session_id, seq, turn, role, text, created_at)
+SELECT @sid, i.seq, i.turn, i.role, i.text, i.created_at FROM _dsh_incoming i
+WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.session_id = @sid AND m.seq = i.seq);
+SET @ins = ROW_COUNT();
+DELETE m FROM messages m WHERE m.session_id = @sid AND NOT EXISTS (SELECT 1 FROM _dsh_incoming i WHERE i.seq = m.seq);
+SET @del = ROW_COUNT();
+SELECT @dropped AS dropped, @changed AS changed, @ins AS inserted, @upd AS updated, @del AS removed;
+"@)
+    try {
+      $outW = Invoke-MySqlScript -Sql ($sb.ToString()) -Db $script:Db
+      $lineNums = @($outW | Where-Object { $_ -match '^\d' } | Select-Object -Last 1)
+      if ($lineNums.Count -gt 0) {
+        $p = ([string]$lineNums[0]) -split "`t"
+        $archDropped = [int]$p[0]; $archChanged = [int]$p[1]
+        $updIns = [int]$p[2]; $updUpd = [int]$p[3]; $updRem = [int]$p[4]
+      }
+    } catch {
+      throw ("phase 1+2 write failed, refusing to touch this session's rows: " + $_.Exception.Message)
+    }
+    # sessions 表用 MySQL 的 upsert
+    [void](Invoke-Exec -Sql @"
+INSERT INTO sessions (session_id, machine, cwd, title, event_count, started_at, last_seen_at)
+VALUES (@sid, @machine, @cwd, @title, @cnt, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))
+ON DUPLICATE KEY UPDATE machine = VALUES(machine), cwd = VALUES(cwd), title = VALUES(title),
+                        event_count = VALUES(event_count), last_seen_at = VALUES(last_seen_at)
+"@ -Params @{ '@sid' = $sid; '@machine' = [string]$env:COMPUTERNAME; '@cwd' = $cwd; '@title' = $sessTitle; '@cnt' = $events.Count })
+  } else {
   $cnW = New-Cn $script:Db
   try {
     $cmdW = $cnW.CreateCommand()
@@ -722,6 +819,7 @@ USING (SELECT @sid AS session_id, @machine AS machine, @cwd AS cwd, @title AS ti
 WHEN MATCHED THEN UPDATE SET machine=s.machine, cwd=s.cwd, title=s.title, last_seen_at=SYSUTCDATETIME(), event_count=@cnt
 WHEN NOT MATCHED THEN INSERT (session_id, machine, cwd, title, event_count) VALUES (s.session_id, s.machine, s.cwd, s.title, @cnt);
 "@ -Params @{ '@sid' = $sid; '@machine' = $env:COMPUTERNAME; '@cwd' = $cwd; '@title' = $sessTitle; '@cnt' = $events.Count })
+  }
   Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
 
   # remember what we imported so the next run can skip it
