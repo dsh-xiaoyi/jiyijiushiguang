@@ -104,7 +104,19 @@ function Read-TextFile([string]$Path) {
 
 $Root    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $CfgPath = Join-Path $Root 'dsh-mem.config.json'
-if (-not (Test-Path -LiteralPath $CfgPath)) { throw "config not found: $CfgPath" }
+# 配置查找兜底（开源版：不要求用户把配置放在脚本旁边）
+if (-not (Test-Path -LiteralPath $CfgPath)) {
+    $candidates = @(
+        $env:DSH_MEM_CONFIG,
+        (Join-Path 'C:\dsh-mem' 'dsh-mem.config.json'),
+        (Join-Path $PSScriptRoot '..\dsh-mem.config.json')
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+    if ($candidates) { $CfgPath = @($candidates)[0] }
+}
+if (-not (Test-Path -LiteralPath $CfgPath)) {
+    throw ("config not found: " + $CfgPath + "
+  解决：把 dsh-mem.config.json 放到 C:\dsh-mem\，或用 -Root <目录> 指定，或设环境变量 DSH_MEM_CONFIG")
+}
 $cfg = Read-TextFile $CfgPath | ConvertFrom-Json
 
 # --- explicit version, so the fleet never has to infer it from a byte count again ------------
