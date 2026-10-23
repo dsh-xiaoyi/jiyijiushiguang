@@ -78,6 +78,28 @@ powershell -File memory\dsh-mem.ps1 search 记忆
 
 > 本仓库**不包含**任何常驻服务/闭源程序：刷新要么靠计划任务，要么靠插件自触发，二选一即可。
 
+## MySQL 版怎么装（v0.2.0 · 建表已验证）
+
+```bash
+# 1) 建库（utf8mb4 必须显式）
+mysql -uroot -p -e "CREATE DATABASE dsh_memory CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
+
+# 2) 建账号（只给这个库的权限）
+mysql -uroot -p -e "CREATE USER 'dsh'@'%' IDENTIFIED WITH mysql_native_password BY '你的强口令';
+                    GRANT ALL PRIVILEGES ON dsh_memory.* TO 'dsh'@'%'; FLUSH PRIVILEGES;"
+
+# 3) 建表（按编号执行；连接时把会话时区设为 UTC）
+for f in sql/mysql/0*.sql; do
+  mysql --defaults-extra-file=my.cnf --init-command="SET time_zone='+00:00'" dsh_memory < "$f"
+done
+
+# 4) 验收
+mysql --defaults-extra-file=my.cnf -t dsh_memory < sql/mysql/009-verify.sql
+```
+
+实测环境：**MySQL 8.0.12（Windows）**，10 张表 + 6 个只追加触发器全部建成；
+`UPDATE/DELETE messages` 会被触发器拦住（SQLSTATE 45000），`UPDATE memories` 正常放行。
+
 ## 目录
 
 ```
@@ -93,8 +115,9 @@ docs\       为什么做 / 记忆设计（含三层缺陷复盘）/ 复盘集 / 
 | 数据库 | 状态 | 适合谁 |
 |---|---|---|
 | **SQL Server** | ✅ 本仓库当前版本 | 已有 SQL Server 授权的人 |
-| **SQLite** | ⏳ 计划中（单独版本） | 单机用户：零安装、零授权、一个文件 |
-| **MySQL** | ⏳ 计划中（单独版本） | 多机共享记忆、但又没有 SQL Server 授权的人 |
+| **MySQL** | 🚧 进行中（v0.2.0，建表脚本已验证） | 多机共享、又不想买 SQL Server 授权的人 |
+| **SQLite** | ⏳ 计划中（v0.3.0） | 单机用户：零安装、零授权、一个文件 |
+
 
 > 我们自己的集群仍跑 SQL Server，不切换；SQLite/MySQL 会作为**独立版本**开发、测试通过后再发布。
 > 这样每个版本都能"下载就能用"，而不是让用户自己改连接字符串和方言。

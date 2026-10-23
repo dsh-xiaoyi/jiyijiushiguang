@@ -1,5 +1,17 @@
 # 变更记录
 
+## 未发布 — MySQL 版（v0.2.0 候选）
+
+### 新增
+- `sql/mysql/`：10 张表的 MySQL 8.0 方言建表脚本 + 6 个只追加触发器（替代 SQL Server 的 DENY UPDATE/DELETE）
+- 已在 **MySQL 8.0.12** 上实测：建表全绿；`messages/messages_history/lesson_records` 的 UPDATE/DELETE 会被拦住
+- 时间统一存 UTC：连接时 `SET time_zone='+00:00'`，`CURRENT_TIMESTAMP(3)` 即为 UTC（已用 `UTC_TIMESTAMP(3)` 对平验证）
+
+### 说明
+- 触发器需要 `log_bin_trust_function_creators=1`（或 SUPER），见 `sql/mysql/007-append-only.sql` 头部
+- 引擎 provider 抽象（`sqlserver|mysql`）尚未开始，下一步
+
+
 ## v0.1.0 (2026-10-23) — 首发（SQL Server 版，experimental）
 
 ### 新增
