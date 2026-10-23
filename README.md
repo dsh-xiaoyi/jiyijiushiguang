@@ -20,6 +20,15 @@
 2. **取**：按关键词 + IDF（稀有词加权）检索，不用语义模型也能答到点上
 3. **放**：每轮会话自动注入「强制指令 + 相关旧记忆 + 关键约定全文 + 定义型记忆」
 
+## 环境要求
+
+```
+PowerShell 5.1+（Windows 10 / 11 / Server 2016 及以上系统自带）
+Node.js（只有注入插件需要）
+SQL Server（Express 免费版即可）—— 建表时需要一次 sysadmin
+Windows 7 用户：需先装 WMF 5.1（系统自带的是 PowerShell 2.0），否则脚本无法运行
+```
+
 ## 5 分钟跑起来（Windows + SQL Server）
 
 ```powershell
