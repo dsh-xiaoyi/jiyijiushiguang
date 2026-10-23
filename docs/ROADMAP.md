@@ -1,39 +1,39 @@
 # Roadmap
 
-Planned work, in order. Times are local (Asia/Shanghai).
+> 顺序按"对用户门槛的降低程度"排，不按技术兴趣排。
 
-## 2026-10-25 (Sat)
+## v0.1.0（当前，已完成）— SQL Server 版
 
-- [ ] `bridge/` — receiver plugin, poller, watchdog; every host/port/user/token replaced by a placeholder
-- [ ] `bridge/docs/architecture.md` — the two-leg model (live DSH session ↔ store ↔ file poller ↔ DSH route)
-- [ ] `bridge/docs/security.md` — loopback-only, one token per pair, ACL hardening, threat model
-- [ ] `bridge/docs/permissions.md` — exactly which permissions each piece needs, and why
-- [ ] `bridge/docs/tokens.md` — why tokens are per pair, how to rotate them without breaking the fleet
-- [ ] `bridge/docs/troubleshooting.md` — the traps we actually hit (random ports, list binding, BOM, ACL)
+- [x] 引擎 CLI：`save` / `search` / `recent` / `sync` / `backup` / `replica` / `history`
+- [x] 注入插件：强制指令 + IDF 自动检索 + 关键约定全文 + 定义型记忆
+- [x] SQL Server 建表脚本（13 个）
+- [x] 体检脚本 `ops\doctor.ps1`、安装脚本 `ops\install.ps1`
+- [x] 文档：为什么做 / 设计 / 复盘 / 权限与安全软件 / 文件地图
 
-## 2026-10-25 (Sat, evening)
+## v0.2.0 — SQLite 版（单独版本）
 
-- [ ] `guard/` — the four rule families: backup-first, verify-after-change, install re-check, rollback
-- [ ] `guard/checks/` — encoding + parse + command-existence + parity checks (configurable)
+- [ ] 驱动：改用无需安装的服务端数据库（单文件）
+- [ ] SQL 方言移植：`sql/sqlite/*.sql`
+- [ ] 引擎：抽象"连接 / 执行 / 参数 / 取单值"四层，按 `-Provider sqlite` 切换
+- [ ] 备份：`.db` 文件级快照（VACUUM INTO 或文件复制 + 校验）
+- [ ] 测试：全新 Windows 上"零安装"跑通完整闭环
+- [ ] 文档：SQLite 版 README（默认路径、单机最佳实践）
 
-## 2026-10-26 (Sun, morning)
+## v0.3.0 — MySQL 版（单独版本）
 
-- [ ] `rescue/docs/diagnose.md` — where the evidence lives: plugin-manager logs, patch backups,
-      `package.json`, session cache sizes, `fiberPhase`
-- [ ] `rescue/docs/decision-tree.md` — symptom → evidence → action
-- [ ] `rescue/docs/rollback.md` — R1 config, R2 plugin, R3 disable-only, R4 database, R5 whole profile
-- [ ] `rescue/docs/winrm.md` — remote forensics: setup, credential handling, the three execution modes
-      and the traps in each
+- [ ] 驱动：MySqlConnector（MIT，可随仓库分发）
+- [ ] SQL 方言移植：`sql/mysql/*.sql`（AUTO_INCREMENT / UTC_TIMESTAMP / ON DUPLICATE KEY / 触发器替代 DENY）
+- [ ] 备份：`mysqldump` / `mysql < file`
+- [ ] 测试：在虚拟机里装 MySQL 8 全链路验证
+- [ ] 文档：MySQL 版 README（建库授权、字符集 utf8mb4、时区）
 
-## 2026-10-26 (Sun, afternoon)
+## v0.4.0 — 检索升级（可选）
 
-- [ ] `memory-guide/docs/01-install-sql.md` … `07-privacy.md` — tutorials only, no data
-- [ ] `memory-guide/docs/03-rules.md` — the rule-library method (the most valuable part)
+- [ ] 向量检索接入（embeddings 表已就位，缺 embedding 生成与召回）
+- [ ] 混合排序：关键词 IDF + 向量相似度
 
-## Before going public
+## 原则
 
-- [ ] `tools/scrub-audit.ps1` returns 0 on the whole tree
-- [ ] five random files read end to end by a human
-- [ ] `docs/SECURITY.md` present and honest
-- [ ] no data exports, logs, screenshots or session dumps
-- [ ] git history starts from the final shape (never "add then delete a secret")
+- 每个数据库版本**独立目录、独立发布**，不做"同一份代码到处 if"
+- 每个版本发布前必须：语法检查 + secret-scan + 全新机器安装演练
+- 不改用户机器上的安全设置；杀软拦截一律走"加白名单"

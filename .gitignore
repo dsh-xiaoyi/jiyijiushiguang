@@ -1,50 +1,29 @@
-# Never commit secrets, local state, or data. tools/scrub-audit.ps1 enforces this too.
-
-# --- secrets & credentials ---
-.credentials.yaml
+# 凭据与秘密 —— 永远不要提交
 *.token
-*token*.txt
-bridge-peers.json
-peers.json
-config.json
-secrets.json
+*peers*.json
+!examples/peers.example.json
+*config.json
+!examples/config.example.json
+.credentials.yaml
 *.pfx
+*.key
 *.pem
-id_rsa*
-id_ed25519*
-ssh-keys/
 
-# --- local runtime state ---
+# 运行产物
 logs/
+outbox/
 *.log
-*.jsonl
-_inbox/
-_outbox/
-bak/
 *.bak
-*.bak-before-*
 *.bak-*
+*.7z
+*.zip
 
-# --- data (never publish) ---
-data/
-exports/
-memories*.json
-*.sqlite
-*.db
-*.mdf
-*.ldf
-*.bak
+# 记忆库数据导出（绝不入库）
+*-backup-*.json
+replica*.json
 
-# --- toolchain ---
+# 工具目录
 node_modules/
-.pnpm-store/
-dist/
-build/
-.venv/
-
-# --- editors / OS ---
+_tmp/
+_share/
 .vscode/
-.idea/
-Thumbs.db
-desktop.ini
-.DS_Store
