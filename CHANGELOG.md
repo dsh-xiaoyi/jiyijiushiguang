@@ -1,6 +1,6 @@
 # 变更记录
 
-## 未发布 — MySQL 版（v0.2.0 候选）
+## v0.2.0 (2026-10-24) — MySQL 版（experimental）
 
 ### 引擎（provider 切换，同一份脚本支持两种数据库）
 - 新增 `provider`：`sqlserver`（默认）/ `mysql`
