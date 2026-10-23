@@ -11,6 +11,12 @@
 - `Register-Host`：MySQL 分支用 `CURRENT_USER()` + 本机名做 upsert
 - `replica`：真的按配置的 `replicaPath` 落盘（之前硬编码在脚本旁边，与文档不符）
 
+### 验收（2026-10-24）
+- 验收报告：`docs/11-mysql-acceptance.md`（命令矩阵 + 5 个已修问题 + 限制）
+- 结论：记忆读写链路（save/search/recent/history/secrets/stats/roster/replica/backup）**全部通过**；
+  `sync`（会话导入）**尚未移植** —— SQL Server 用 SqlBulkCopy，MySQL 需改行级写入
+- 补入 `memory/dsh-zstd-extract.js`（sync 的解压环节必需，之前漏在仓库外；需 Node 22.15+/23+）
+
 ### 备份与端到端（2026-10-24）
 - `backup`：MySQL 分支用 `mysqldump`（`--single-transaction --routines --triggers`），
   实测在 8.0.12 上产出 19.7KB dump，含 10 张表与全部触发器；`mysqldumpCliPath` 可配置

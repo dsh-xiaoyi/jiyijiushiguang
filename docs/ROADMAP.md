@@ -24,11 +24,12 @@
 - [x] 后端选型：**mysql.exe 命令行走**（零额外依赖；MySqlConnector 在 PS 5.1 要 7 个 DLL，放弃）
 - [x] SQL 方言移植：`sql/mysql/*.sql`（10 表 + 6 触发器，实测建表通过）
 - [x] 只追加保护：BEFORE UPDATE/DELETE 触发器 + SIGNAL（等价 SQL Server 的 DENY）
-- [ ] 引擎 provider 抽象（`provider: sqlserver|mysql`）与参数转义
-- [ ] 备份：mysqldump / mysql < file
+- [x] 引擎 provider 抽象（`provider: sqlserver|mysql`）与参数转义 —— 10 个命令实测通过
+- [x] 备份：mysqldump（实测 19.7KB dump，含触发器）
 - [ ] 备份：`mysqldump` / `mysql < file`
 - [x] 建表验证：MySQL 8.0.12（Win7 测试机）10 表 + 6 触发器全部建成
-- [ ] 端到端：save/search/replica 走 mysql 后端
+- [x] 端到端：save/search/replica + 插件注入 verify.mjs **PASS**
+- [ ] **sync（会话导入）移植** —— SqlBulkCopy 无 MySQL 等价物，需改行级写入；见 docs/11
 - [ ] 文档：MySQL 版 README（建库授权、字符集 utf8mb4、时区）
 
 ## v0.4.0 — 检索升级（可选）

@@ -236,10 +236,12 @@ function ConvertTo-MySqlSql {
   # N'...' → '...'
   $s = [regex]::Replace($s, "(?i)\bN'", "'")
   # TOP (n) → LIMIT n（挪到语句末尾）
+  # TOP 有两种写法：TOP (n) 和 TOP n —— 两种都要处理（engine 里都有）
   $mt = [regex]::Match($s, '(?is)\bTOP\s*\(\s*([^)]+?)\s*\)')
+  if (-not $mt.Success) { $mt = [regex]::Match($s, '(?is)\bTOP\s+(\d+)\b') }
   if ($mt.Success) {
     $lim = $mt.Groups[1].Value.Trim()
-    $s = [regex]::Replace($s, '(?is)\bSELECT\s+TOP\s*\(\s*[^)]+?\s*\)\s+', 'SELECT ')
+    $s = [regex]::Replace($s, '(?is)\bSELECT\s+TOP\s*(?:\(\s*[^)]+?\s*\)|\d+)\s+', 'SELECT ')
     $s = $s.TrimEnd().TrimEnd(';') + ' LIMIT ' + $lim
   }
   return $s
@@ -1750,8 +1752,14 @@ WHERE e.model = @model AND r.rn > 1
     # Owner-authorised clear-text credential list (rules R39).  Deliberately does NOT run Protect-Text:
     # the whole point is to read the stored value back.  Local-only; the banner says what not to do.
     $pat = [string]$Target
-    if ($pat) { $rows = Invoke-Rows -Sql "SELECT TOP 300 id, subject, title, body, tags, CONVERT(varchar(19), created_at, 120) AS at FROM dbo.memories WHERE kind='secret' AND (subject LIKE '%'+@p+'%' OR title LIKE '%'+@p+'%' OR body LIKE '%'+@p+'%' OR tags LIKE '%'+@p+'%') ORDER BY id DESC" -Params @{ '@p' = $pat } }
-    else      { $rows = Invoke-Rows -Sql "SELECT TOP 300 id, subject, title, body, tags, CONVERT(varchar(19), created_at, 120) AS at FROM dbo.memories WHERE kind='secret' ORDER BY id DESC" -Params @{} }
+    # 2026-10-24: 改成 provider 无关 —— LIKE 用单个参数（不再拼接 '%'+@p+'%'，MySQL 里 + 是加法），
+    # 时间也不再依赖 CONVERT(...,120)，取原始值在 PowerShell 里格式化。
+    if ($pat) {
+      $like = '%' + $pat + '%'
+      $rows = Invoke-Rows -Sql "SELECT TOP 300 id, subject, title, body, tags, created_at FROM dbo.memories WHERE kind='secret' AND (subject LIKE @p OR title LIKE @p OR body LIKE @p OR tags LIKE @p) ORDER BY id DESC" -Params @{ '@p' = $like }
+    }
+    else { $rows = Invoke-Rows -Sql "SELECT TOP 300 id, subject, title, body, tags, created_at FROM dbo.memories WHERE kind='secret' ORDER BY id DESC" -Params @{} }
+    foreach ($r in @($rows)) { if ($r.created_at) { $r | Add-Member -NotePropertyName at -NotePropertyValue (([datetime]$r.created_at).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')) -Force } else { $r | Add-Member -NotePropertyName at -NotePropertyValue '-' -Force } }
     Write-Host ""
     Write-Host "  == stored credentials (kind=secret, CLEAR TEXT on purpose) =="
     Write-Host "     local-only: do NOT copy this output to a shared folder or into a chat log"
@@ -1768,12 +1776,22 @@ WHERE e.model = @model AND r.rn > 1
   }
   'stats' {
     if (Test-DbAlive) {
+      if ($script:Provider -eq 'mysql') {
+        $s = Invoke-Rows -Sql @"
+SELECT (SELECT COUNT(*) FROM sessions) AS sessions,
+       (SELECT COUNT(*) FROM messages) AS messages,
+       (SELECT COUNT(*) FROM memories) AS memories,
+       (SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 1)
+          FROM information_schema.tables WHERE table_schema = DATABASE()) AS size_mb
+"@
+      } else {
       $s = Invoke-Rows -Sql @"
 SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
        (SELECT COUNT(*) FROM dbo.messages) AS messages,
        (SELECT COUNT(*) FROM dbo.memories) AS memories,
        (SELECT CAST(SUM(size)*8.0/1024 AS DECIMAL(10,1)) FROM sys.database_files) AS size_mb
 "@
+      }
       Write-Host ("  sessions : " + $s[0].sessions)
       Write-Host ("  messages : " + $s[0].messages)
       Write-Host ("  memories : " + $s[0].memories)
