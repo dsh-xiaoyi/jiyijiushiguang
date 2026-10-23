@@ -5,7 +5,9 @@
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
-| `server` | 是 | SQL Server 地址：`127.0.0.1,1433` 或 `127.0.0.1\SQLEXPRESS` |
+| `provider` | 否 | `sqlserver`（默认）或 `mysql` |
+| `server` | 是 | sqlserver：`127.0.0.1,1433` 或 `127.0.0.1\SQLEXPRESS`；mysql：`主机,端口` |
+| `mysqlCliPath` | 否 | mysql 客户端路径（默认走 PATH 里的 `mysql`）；Win 上一般是 `...\MySQL Server 8.0\bin\mysql.exe` |
 | `database` | 是 | 数据库名，默认 `DSHMemory` |
 | `user` / `password` | 否 | SQL 登录（建议单独建低权限账号）；留空 = Windows 集成认证 |
 | `sessionsRoot` | 是 | DSH 会话目录，Windows 一般 `%USERPROFILE%\.dsh\sessions`；`sync` 从这里导入 |
@@ -34,4 +36,28 @@
 · 日常运行用低权限账号（只对 DSHMemory 有 db_datareader/db_datawriter）；建表时才用 sysadmin
 · 口令不要写进脚本/聊天/日志；配置文件 ACL 收紧到当前用户
 · redact 里至少放：数据库口令、桥令牌、任何不想入库的字符串
+```
+
+## MySQL 后端（provider = mysql）
+
+```json
+{
+  "provider": "mysql",
+  "server": "127.0.0.1,3306",
+  "database": "dsh_memory",
+  "user": "dsh",
+  "password": "EXAMPLE_PASSWORD",
+  "sessionsRoot": "C:\\Users\\YOURNAME\\.dsh\\sessions",
+  "mysqlCliPath": "C:\\Program Files\\MySQL\\MySQL Server 8.0\\bin\\mysql.exe",
+  "replicaPath": "C:\\dsh-mem\\dsh-mem-replica.json"
+}
+```
+
+要点：
+
+```
+· 引擎通过 **mysql.exe** 执行 SQL（不依赖任何 DLL），所以 mysql 客户端必须在 PATH 或 mysqlCliPath 里
+· 每次查询都是一次新的进程/连接：因此 INSERT 与 LAST_INSERT_ID() 必须在同一次调用里（引擎已处理）
+· 时间统一 UTC：引擎每次调用都会带 --init-command=SET time_zone='+00:00'
+· 建表脚本在 sql/mysql/，建表前先跑 007-append-only.sql 需要的权限说明见该文件头部
 ```

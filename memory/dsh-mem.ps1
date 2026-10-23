@@ -119,6 +119,13 @@ if (-not (Test-Path -LiteralPath $CfgPath)) {
 }
 $cfg = Read-TextFile $CfgPath | ConvertFrom-Json
 
+# ================= 数据库后端（sqlserver / mysql）=================
+$script:Provider = if ($cfg.provider) { ([string]$cfg.provider).Trim().ToLower() } else { 'sqlserver' }
+if (@('sqlserver', 'mysql') -notcontains $script:Provider) {
+  throw ("provider 只支持 sqlserver / mysql（当前: " + $script:Provider + "）")
+}
+$script:MySqlCliPath = if ($cfg.mysqlCliPath) { [string]$cfg.mysqlCliPath } else { 'mysql' }
+
 # --- explicit version, so the cluster never has to infer it from a byte count again ------------
 # Lineage: 32174 (prune/handoff) -> 53025 (offline replica) -> 74605 (recall + embed half)
 #          -> 77609 (path b: vectors keyed by content hash) -> 80330 (3 defects fixed)
@@ -166,7 +173,8 @@ Add-Type -AssemblyName System.Data
 $script:Db          = $cfg.database
 $script:CsBase      = "Server=$($cfg.server);User Id=$($cfg.user);Password=$($cfg.password);TrustServerCertificate=True;Connect Timeout=20"
 $script:StatePath   = Join-Path $Root 'dsh-mem-state.json'
-$script:ReplicaPath = Join-Path $Root 'dsh-mem-replica.json'
+# 副本路径：配置里写了就用配置的（文档承诺过），否则默认放在脚本旁边
+$script:ReplicaPath = if ($cfg.replicaPath) { [string]$cfg.replicaPath } else { Join-Path $Root 'dsh-mem-replica.json' }
 $script:ReplicaError = ''
 $script:RedactList  = @()
 if ($cfg.redact) { $script:RedactList = @($cfg.redact) }
@@ -174,7 +182,176 @@ $script:State       = if (Test-Path -LiteralPath $script:StatePath) {
                         try { Read-TextFile $script:StatePath | ConvertFrom-Json } catch { [pscustomobject]@{} }
                       } else { [pscustomobject]@{} }
 
+# ============ MySQL 后端（走 mysql.exe，零额外依赖）============
+function ConvertTo-MySqlLiteral {
+  param($Value)
+  if ($null -eq $Value) { return 'NULL' }
+  if ($Value -is [bool]) { if ($Value) { return '1' } else { return '0' } }
+  if (($Value -is [int]) -or ($Value -is [long]) -or ($Value -is [double]) -or ($Value -is [decimal])) {
+    return $Value.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+  }
+  if ($Value -is [datetime]) { return ("'" + $Value.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss.fff') + "'") }
+  $t = [string]$Value
+  $t = $t.Replace('\', '\\').Replace("'", "''")
+  return ("'" + $t + "'")
+}
+
+function ConvertTo-MySqlSql {
+  param([string]$Sql, [hashtable]$Params)
+  $s = $Sql
+  # ① 参数替换（先替长名字，避免 @n 吃掉 @n2）
+  if ($Params -and $Params.Count -gt 0) {
+    foreach ($k in (@($Params.Keys) | Sort-Object Length -Descending)) {
+      $lit = ConvertTo-MySqlLiteral $Params[$k]
+      $pat = [regex]::Escape([string]$k) + '(?![A-Za-z0-9_])'
+      $s = [regex]::Replace($s, $pat, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $lit })
+    }
+  }
+  # ② MERGE ... machines → INSERT ... ON DUPLICATE KEY UPDATE
+  if ($s -match '(?is)^\s*MERGE\s+(?:dbo\.)?machines') {
+    $m = [regex]::Match($s, '(?is)USING\s*\(\s*SELECT\s+(.+?)\s+AS\s+login_name\s*,\s*(.+?)\s+AS\s+machine(?:\s*,\s*(.+?)\s+AS\s+cli_version)?\s*\)')
+    if ($m.Success) {
+      $login = $m.Groups[1].Value.Trim()
+      $machine = $m.Groups[2].Value.Trim()
+      $ver = if ($m.Groups[3].Success) { $m.Groups[3].Value.Trim() } else { 'NULL' }
+      return ("INSERT INTO machines (login_name, machine, cli_version, first_seen, last_seen) VALUES (" +
+              $login + ", " + $machine + ", " + $ver + ", UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)) " +
+              "ON DUPLICATE KEY UPDATE machine = VALUES(machine), cli_version = VALUES(cli_version), last_seen = VALUES(last_seen)")
+    }
+  }
+  # ③ 方言映射
+  $s = $s -replace '\bdbo\.', ''
+  $s = [regex]::Replace($s, '(?i)\bISNULL\s*\(', 'IFNULL(')
+  $s = [regex]::Replace($s, '(?i)\bSYSUTCDATETIME\s*\(\s*\)', 'UTC_TIMESTAMP(3)')
+  $s = [regex]::Replace($s, '(?i)\bGETUTCDATE\s*\(\s*\)', 'UTC_TIMESTAMP(3)')
+  $s = [regex]::Replace($s, '(?i)\bLEN\s*\(', 'CHAR_LENGTH(')
+  $s = [regex]::Replace($s, '(?i)\bDATALENGTH\s*\(', 'OCTET_LENGTH(')
+  $s = [regex]::Replace($s, '(?i)\bSUSER_SNAME\s*\(\s*\)', (ConvertTo-MySqlLiteral $script:MyLoginName))
+  $s = [regex]::Replace($s, '(?i)\bHOST_NAME\s*\(\s*\)', (ConvertTo-MySqlLiteral $env:COMPUTERNAME))
+  # CONVERT(varchar(33), X, 126) → DATE_FORMAT(X,'%Y-%m-%dT%H:%i:%s')
+  $s = [regex]::Replace($s, '(?is)CONVERT\s*\(\s*varchar\s*\(\s*\d+\s*\)\s*,\s*(.+?)\s*,\s*126\s*\)', "DATE_FORMAT(`$1, '%Y-%m-%dT%H:%i:%s')")
+  # N'...' → '...'
+  $s = [regex]::Replace($s, "(?i)\bN'", "'")
+  # TOP (n) → LIMIT n（挪到语句末尾）
+  $mt = [regex]::Match($s, '(?is)\bTOP\s*\(\s*([^)]+?)\s*\)')
+  if ($mt.Success) {
+    $lim = $mt.Groups[1].Value.Trim()
+    $s = [regex]::Replace($s, '(?is)\bSELECT\s+TOP\s*\(\s*[^)]+?\s*\)\s+', 'SELECT ')
+    $s = $s.TrimEnd().TrimEnd(';') + ' LIMIT ' + $lim
+  }
+  return $s
+}
+
+function ConvertFrom-MySqlEscaped {
+  param([string]$Text)
+  if ($Text -eq '\N') { return $null }          # batch 模式的 NULL
+  return ($Text -replace '\\t', "`t" -replace '\\n', "`n" -replace '\\r', "`r" -replace '\\\\', '\' -replace "\\'", "'")
+}
+
+function Invoke-MySqlCli {
+  param([string]$Sql, [string]$Db)
+  if (-not $Db) { $Db = $script:Db }
+  # SET time_zone='+00:00' —— 用 [char]39 拼，避免多层引号嵌套
+  $tzInit = '--init-command=SET time_zone=' + [char]39 + '+00:00' + [char]39
+  $cnf = [System.IO.Path]::GetTempFileName()
+  try {
+    $lines = @('[client]',
+               ('user=' + [string]$cfg.user),
+               ('password=' + [string]$cfg.password),
+               ('host=' + ([string]$cfg.server).Split(',')[0]),
+               'port=3306',
+               'connect-timeout=20')
+    if (([string]$cfg.server) -match ',\s*(\d+)\s*$') { $lines[4] = 'port=' + $matches[1] }
+    [System.IO.File]::WriteAllText($cnf, ($lines -join "`r`n"), (New-Object System.Text.ASCIIEncoding))
+    $argList = @(
+      ('--defaults-extra-file=' + $cnf),
+      '--batch', '--default-character-set=utf8mb4',
+      $tzInit,
+      '-e', $Sql, $Db
+    )
+    $out = & $script:MySqlCliPath @argList 2>&1
+    $code = $LASTEXITCODE
+    if ($code -ne 0) {
+      $msg = (@($out) | Where-Object { $_ -and ($_ -notmatch 'Using a password on the command line') }) -join ' | '
+      throw ('mysql error ' + $code + ': ' + $msg)
+    }
+    return @($out)
+  } finally { Remove-Item -LiteralPath $cnf -Force -ErrorAction SilentlyContinue }
+}
+
+function ConvertTo-MySqlRows {
+  param([string[]]$RawLines)
+  $lines = @($RawLines | Where-Object { $_ -ne $null })
+  if ($lines.Count -eq 0) { return @() }
+  $header = $lines[0] -split "`t"
+  $rows = New-Object System.Collections.ArrayList
+  for ($i = 1; $i -lt $lines.Count; $i++) {
+    $cells = $lines[$i] -split "`t"
+    $h = [ordered]@{}
+    for ($c = 0; $c -lt $header.Count; $c++) {
+      $raw = if ($c -lt $cells.Count) { $cells[$c] } else { '' }
+      $v = ConvertFrom-MySqlEscaped $raw
+      if ($v -is [string] -and $v -match '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$') {
+        $v = [datetime]::SpecifyKind([datetime]::ParseExact(($v -replace '(\.\d+)$', ''), 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture), [System.DateTimeKind]::Utc)
+      }
+      $h[$header[$c]] = $v
+    }
+    [void]$rows.Add([pscustomobject]$h)
+  }
+  return $rows.ToArray()
+}
+
+function New-MySqlShim {
+  param([string]$Db)
+  $shim = [pscustomobject]@{ Database = $Db; Open_ = $false }
+  $shim | Add-Member -MemberType ScriptMethod -Name Open -Value { $this.Open_ = $true }
+  $shim | Add-Member -MemberType ScriptMethod -Name Close -Value { $this.Open_ = $false }
+  $shim | Add-Member -MemberType ScriptMethod -Name CreateCommand -Value {
+    $cmd = [pscustomobject]@{ CommandText = ''; CommandTimeout = 120; Params = @{} }
+    $cmd | Add-Member -MemberType ScriptMethod -Name ExecuteNonQuery -Value {
+      $sql = ConvertTo-MySqlSql -Sql $this.CommandText -Params $this.Params
+      $null = Invoke-MySqlCli -Sql $sql
+      return 1
+    }
+    $cmd | Add-Member -MemberType ScriptMethod -Name ExecuteReader -Value {
+      $sql = ConvertTo-MySqlSql -Sql $this.CommandText -Params $this.Params
+      $raw = Invoke-MySqlCli -Sql $sql
+      $rows = ConvertTo-MySqlRows -RawLines $raw
+      $names = @()
+      if (@($rows).Count -gt 0) { $names = @($rows[0].PSObject.Properties.Name) }
+      else {
+        $ls = @($raw | Where-Object { $_ -ne $null })
+        if ($ls.Count -ge 1) { $names = @($ls[0] -split "`t") }
+      }
+      $rd = [pscustomobject]@{ Rows = @($rows); Names = $names; Index = -1 }
+      $rd | Add-Member -MemberType ScriptMethod -Name Read -Value { $this.Index++; return ($this.Index -lt @($this.Rows).Count) }
+      # FieldCount 必须是**属性**：Invoke-Rows 用 $rd.FieldCount 取值，
+      # 写成 get_FieldCount() 方法在 PSObject 上不会被当成属性读，结果永远是 $null（实测踩过）
+      $rd | Add-Member -MemberType NoteProperty -Name FieldCount -Value (@($names).Count) -Force
+      $rd | Add-Member -MemberType ScriptMethod -Name GetName -Value { param($i) return [string]@($this.Names)[$i] }
+      $rd | Add-Member -MemberType ScriptMethod -Name GetValue -Value { param($i) $n = [string]@($this.Names)[$i]; return $this.Rows[$this.Index].$n }
+      $rd | Add-Member -MemberType ScriptMethod -Name Close -Value { }
+      return $rd
+    }
+    $paramsObj = [pscustomobject]@{}
+    $paramsObj | Add-Member -MemberType ScriptMethod -Name AddWithValue -Value {
+      param($name, $value)
+      $this.Owner.Params[[string]$name] = $value
+      return $null
+    }
+    $paramsObj | Add-Member -NotePropertyName Owner -NotePropertyValue $cmd
+    $cmd | Add-Member -MemberType NoteProperty -Name Parameters -Value $paramsObj
+    return $cmd
+  }
+  return $shim
+}
+
 function New-Cn([string]$db) {
+  if ($script:Provider -eq 'mysql') {
+    $shim = New-MySqlShim -Db $db
+    $shim.Open()
+    return $shim
+  }
   $cn = New-Object System.Data.SqlClient.SqlConnection ("Server=$($cfg.server);Database=$db;User Id=$($cfg.user);Password=$($cfg.password);TrustServerCertificate=True;Connect Timeout=20")
   $cn.Open()
   return $cn
@@ -182,6 +359,10 @@ function New-Cn([string]$db) {
 
 function Test-DbAlive {
   try {
+    if ($script:Provider -eq 'mysql') {
+      $null = Invoke-MySqlCli -Sql 'SELECT 1' -Db $script:Db
+      return $true
+    }
     $cn = New-Object System.Data.SqlClient.SqlConnection ("Server=$($cfg.server);Database=$($script:Db);User Id=$($cfg.user);Password=$($cfg.password);TrustServerCertificate=True;Connect Timeout=3")
     $cn.Open(); $cn.Close(); return $true
   } catch { return $false }
@@ -241,6 +422,26 @@ function Register-Host {
   # SQL Server itself, so a machine cannot claim to be another one.
   # cli_version is what makes "unified version" checkable from the database host instead of by
   # comparing byte counts (memory [177]/[178] got that wrong twice in one hour).
+  if ($script:Provider -eq 'mysql') {
+    # MySQL 没有 MERGE：用 INSERT ... ON DUPLICATE KEY UPDATE。
+    # 身份取"实际的数据库账号 + 本机名"，这两项由连接本身决定，不是调用方随便写的字符串。
+    try {
+      [void](Invoke-Exec -Sql @"
+INSERT INTO machines (login_name, machine, cli_version, first_seen, last_seen)
+VALUES (CURRENT_USER(), @m, @v, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))
+ON DUPLICATE KEY UPDATE machine = VALUES(machine), cli_version = VALUES(cli_version), last_seen = VALUES(last_seen)
+"@ -Params @{ '@m' = $env:COMPUTERNAME; '@v' = $script:CliVersion })
+    } catch {
+      try {
+        [void](Invoke-Exec -Sql @"
+INSERT INTO machines (login_name, machine, first_seen, last_seen)
+VALUES (CURRENT_USER(), @m, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))
+ON DUPLICATE KEY UPDATE machine = VALUES(machine), last_seen = VALUES(last_seen)
+"@ -Params @{ '@m' = $env:COMPUTERNAME })
+      } catch { }
+    }
+    return
+  }
   try {
     [void](Invoke-Exec -Sql @"
 MERGE dbo.machines AS t
@@ -1013,11 +1214,24 @@ if ([string]$Kind -eq 'secret') {
     Assert-Length 'source_session' ([string]$Target) $script:ColLimits.source_session
     # Read back what actually landed: INSERT ... OUTPUT gives the row id and the stored
     # length in the same round trip, so a silent failure or a truncation cannot hide.
+    $saveParams = @{ '@scope' = $Scope; '@subject' = $Subject; '@kind' = $Kind; '@title' = $Title; '@body' = $Body; '@tags' = $Tags; '@src' = $Target; '@conf' = $Confidence }
+    if ($script:Provider -eq 'mysql') {
+      # MySQL 没有 OUTPUT INSERTED。★ 关键：INSERT 与取回必须放在同一次 mysql.exe 调用里，
+      # 因为每次调用都是一个新连接，分开调用时 LAST_INSERT_ID() 会变回 0（实测踩过）。
+      # mysql.exe 的 batch 模式只输出 SELECT 的结果集，所以两条语句一起发是安全的。
+      $res = Invoke-Rows -Sql @"
+INSERT INTO memories (scope, subject, kind, title, body, tags, source_session, confidence)
+VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf);
+SELECT LAST_INSERT_ID() AS id, CHAR_LENGTH(title) AS tlen, CHAR_LENGTH(IFNULL(body,'')) AS blen
+FROM memories WHERE id = LAST_INSERT_ID();
+"@ -Params $saveParams
+    } else {
     $res = Invoke-Rows -Sql @"
 INSERT INTO dbo.memories (scope, subject, kind, title, body, tags, source_session, confidence)
 OUTPUT INSERTED.id AS id, LEN(INSERTED.title) AS tlen, LEN(INSERTED.body) AS blen
 VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf)
-"@ -Params @{ '@scope' = $Scope; '@subject' = $Subject; '@kind' = $Kind; '@title' = $Title; '@body' = $Body; '@tags' = $Tags; '@src' = $Target; '@conf' = $Confidence }
+"@ -Params $saveParams
+    }
     if (@($res).Count -ne 1) { throw "save wrote no row (INSERT returned nothing)" }
     $newId = [int64]$res[0].id
     $gotB  = [int]$res[0].blen

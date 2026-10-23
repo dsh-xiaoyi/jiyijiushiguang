@@ -2,6 +2,21 @@
 
 ## 未发布 — MySQL 版（v0.2.0 候选）
 
+### 引擎（provider 切换，同一份脚本支持两种数据库）
+- 新增 `provider`：`sqlserver`（默认）/ `mysql`
+- MySQL 后端走 `mysql.exe`（零 DLL 依赖）：字面量转义 + 方言翻译
+  （`TOP`→`LIMIT`、`CONVERT(...,126)`→`DATE_FORMAT`、`ISNULL`→`IFNULL`、
+    `MERGE`→`ON DUPLICATE KEY UPDATE`、去掉 `dbo.`）
+- `save`：MySQL 用"INSERT + LAST_INSERT_ID() **同一次调用**"取回 id 与存储长度
+- `Register-Host`：MySQL 分支用 `CURRENT_USER()` + 本机名做 upsert
+- `replica`：真的按配置的 `replicaPath` 落盘（之前硬编码在脚本旁边，与文档不符）
+
+### 实测（2026-10-24 · MySQL 8.0.12）
+- `save` / `search` / `recent` / `roster` / `replica` 全部跑通
+- `roster` 显示 `dsh@% | <机器名> | CLI 1.3.4`，与 SQL Server 版一致
+- 副本文件已加入 .gitignore（它含真实数据与主机信息，**绝不能进仓库**）
+
+
 ### 新增
 - `sql/mysql/`：10 张表的 MySQL 8.0 方言建表脚本 + 6 个只追加触发器（替代 SQL Server 的 DENY UPDATE/DELETE）
 - 已在 **MySQL 8.0.12** 上实测：建表全绿；`messages/messages_history/lesson_records` 的 UPDATE/DELETE 会被拦住
