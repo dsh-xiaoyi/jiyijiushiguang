@@ -1,0 +1,4 @@
+# 只做换行规范；BOM 是文件字节的一部分，不需要属性也会原样保存
+* text=auto eol=lf
+*.ps1 text eol=lf
+*.cmd text eol=crlf

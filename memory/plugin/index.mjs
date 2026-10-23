@@ -18,6 +18,19 @@ function noteErr(where, e) {
   } catch (_) { }
 }
 
+// ---- 副本自刷新（本仓库不含闭源常驻进程；插件在副本过期时后台拉一次）----
+let _lastSpawn = 0
+function ensureFreshReplica(file, cliPath, maxAgeSeconds) {
+  try {
+    const st = statSync(file)
+    if ((Date.now() - st.mtimeMs) / 1000 <= maxAgeSeconds) return
+    if (Date.now() - _lastSpawn < 120000) return
+    _lastSpawn = Date.now()
+    const child = spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', cliPath, 'replica'], { detached: true, stdio: 'ignore' })
+    child.unref()
+  } catch (e) { /* 刷新失败不影响本轮注入 */ }
+}
+
 // dsh-memory-bridge — host half.  v0.3.0
 //
 // TWO JOBS
@@ -181,6 +194,7 @@ export function apply(ctx, config) {
         digest = '## ' + heading + '\n\n警告: 找不到本机离线副本 ' + replicaPath + '\n请检查插件配置 replicaPath，以及 DshMemoryAgent 服务是否在运行。'
         return
       }
+      ensureFreshReplica(replicaPath, cliPath, Number(config.replicaMaxAgeSeconds || 180))
       let rawText = readFileSync(replicaPath, 'utf8')
       if (rawText.charCodeAt(0) === 0xFEFF) rawText = rawText.slice(1)
       const raw = JSON.parse(rawText)

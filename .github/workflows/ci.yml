@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PowerShell syntax check
+        shell: pwsh
+        run: |
+          $bad = 0
+          Get-ChildItem -Recurse -Filter *.ps1 | ForEach-Object {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errs)
+            if ($errs.Count -gt 0) { Write-Host "PARSE FAIL: $($_.FullName)"; $errs | ForEach-Object { Write-Host "  $($_.Message)" }; $bad++ }
+          }
+          if ($bad -gt 0) { exit 1 }
+          Write-Host "all .ps1 parse OK"
+
+      - name: Secret scan (BLOCK must be 0)
+        shell: pwsh
+        run: |
+          ./ops/secret-scan.ps1 -Root .
+          if ($LASTEXITCODE -ne 0) { exit 1 }
