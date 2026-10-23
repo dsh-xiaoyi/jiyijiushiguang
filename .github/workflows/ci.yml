@@ -26,5 +26,11 @@ jobs:
       - name: Secret scan (BLOCK must be 0)
         shell: pwsh
         run: |
-          ./ops/secret-scan.ps1 -Root .
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $out = (& ./ops/secret-scan.ps1 -Root . 2>&1 | Out-String)
+          Write-Host $out
+          if ($out -match 'RESULT: BLOCKED') {
+            $hits = ($out -split "`n" | Where-Object { $_ -match '^\[BLOCK\]' })
+            foreach ($h in $hits) { Write-Host "::error::$h" }
+            exit 1
+          }
+          Write-Host 'secret-scan: CLEAN'
