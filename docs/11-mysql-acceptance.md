@@ -42,6 +42,11 @@
 | 4 | `stats`/`secrets` 报 ERROR 1064 | 引擎里 `TOP n`（无括号）没被翻译；还有 `'%'+@p+'%'` 拼接 | 翻译器支持两种 TOP；LIKE 用单参数 |
 | 5 | `sync` 找不到解压器 | `dsh-zstd-extract.js` 没进仓库 | 已纳入 `memory/dsh-zstd-extract.js`（需 Node 22.15+/23+） |
 
+## 三之二、安全（单独一页）
+
+部署前务必看 [docs/12-mysql-security](12-mysql-security.md)：账号最小权限、3306 不对公网、口令不进命令行、
+备份是明文需加密、utf8mb4、`log_bin_trust_function_creators` 用完要关、`mysqlCliPath` 用绝对路径。
+
 ## 四、已知限制（照实写）
 
 ```

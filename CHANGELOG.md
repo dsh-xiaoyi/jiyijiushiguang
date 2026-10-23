@@ -65,6 +65,11 @@
 ### 明确不含
 - 任何真实环境数据（记忆库内容、对话、主机信息、账号）
 
+### 安全
+- 新增 `docs/12-mysql-security.md`：账号最小权限（别用 root）、3306 不对公网、口令不进命令行、
+  备份是明文需加密存放、必须 utf8mb4、`log_bin_trust_function_creators` 建完触发器就关、
+  `mysqlCliPath` 用绝对路径（防 PATH 劫持）
+
 ### 已知限制
 - 仅支持 SQL Server（SQLite / MySQL 为后续独立版本）
 - 检索是关键词 + IDF，不是语义向量
