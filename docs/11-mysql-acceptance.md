@@ -18,9 +18,10 @@
 | `roster` | ✅ | `dsh@% \| <机器名> \| CLI 1.3.4`，与 SQL Server 版一致 |
 | `replica` | ✅ | 生成副本 JSON；插件 `verify.mjs` 端到端 **PASS**（活动段 4 台机器、UTC 时间正确） |
 | `backup` | ✅ | `mysqldump` 产出 19.7KB dump，含 10 张表 + 6 个触发器 |
-| `handoff` | ⚠ 未测 | 只读 `messages`，逻辑与 SQL Server 版一致；未在测试库上验证输出格式 |
-| `prune` | ⚠ 未测 | 会删历史归档，属不可逆操作，**没有在测试库上跑** |
-| `embed` / `recall` | ⚠ 未测 | 需要配置 `embed` 块（语义检索，可选功能） |
+| `handoff` | ✅ | 只读；测试库无跨机会话时输出 `no session from another machine found`，无报错 |
+| `prune` | ✅ | 干跑正常；`-Force 30` 实测删掉 1 条 60 天前的消息（269→删 1→269），再跑显示 0 待删。<br>**需要维护模式**：messages 有只追加触发器，引擎已改为 `SET @dsh_allow_mutation = 1` 放行 |
+| `recall` | ✅ | 无 embed 块时**明确降级**：`semantic: UNAVAILABLE` + `[DEGRADED]` 提示，回落到字面检索（实测命中 messages 20 条），不假装成功 |
+| `embed` | ⚠ 待端点 | 未配置时报错清晰（提示加 `embed` 块或 `-BaseURL/-Model`）；真实嵌入需要本地模型端点，本次未测 |
 | `sync` | ✅ | 真实会话导入：337 帧 / 1.6MB 文本 → imported user=14 assistant=69 tool=184 total=267；库内 messages=269；再跑 skip unchanged；`-Force` 重跑 **inserted=0 updated=0 removed=0**（幂等）|
 
 ## 二、建表脚本验收（`sql/mysql/`）
@@ -97,4 +98,16 @@ SQL Server 用 #临时表 + SqlBulkCopy；MySQL 没有等价物，而且 mysql.e
 
 实测（2026-10-24）：
   337 帧 / 1.6MB 文本 → 267 行；重复跑 skip；-Force 重跑 inserted=0 updated=0 removed=0
+```
+
+## 八、第二轮验收补充（handoff / prune / recall）
+
+```
+handoff  ✅ 只读，无跨机会话时输出 "no session from another machine found"
+prune    ✅ 干跑 + -Force 都通过；但 messages 的只追加触发器会拦 DELETE
+            ⇒ 引擎已改为在 MySQL 上走维护模式（SET @dsh_allow_mutation = 1），
+              实测：造一条 60 天前的消息 → prune -Force 30 删掉 → 再跑显示 0 待删
+recall   ✅ 没有 embed 配置时**明确降级**（semantic: UNAVAILABLE + [DEGRADED]），
+            回落到字面检索并给出命中数 —— 这是正确行为：宁可说"降级"，不假装"语义检索成功"
+embed    ⚠ 需要模型端点（bge-m3 之类），本次未测；未配置时的报错信息是可读的
 ```
