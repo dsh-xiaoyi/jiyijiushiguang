@@ -50,7 +50,7 @@
 | `11-mysql-acceptance.md` | MySQL 版验收矩阵与限制 |
 | `12-mysql-security.md` | MySQL 部署的安全注意事项（账号/端口/备份/字符集） |
 | `13-mysql-compatibility.md` | MySQL/MariaDB 版本兼容矩阵与差异改法 |
-| `14-sqlite.md` | SQLite 版安装/配置/差异/安全边界 |\n| `15-verification-checklist.md` | 验收自查清单（独立断言，抓静默失败） |
+| `14-sqlite.md` | SQLite 版安装/配置/差异/安全边界 |\n| `15-verification-checklist.md` | 验收自查清单（独立断言，抓静默失败） |\n| `16-long-term-notes.md` | 长期运行说明（三档结论 / 纪律 / 未验证项 / 小机器配置） |
 | `ROADMAP.md` | 接下来做什么 |
 | `09-file-map.md` | 本页 |
 
