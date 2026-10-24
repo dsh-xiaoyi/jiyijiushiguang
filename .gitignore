@@ -27,3 +27,4 @@ node_modules/
 _tmp/
 _share/
 .vscode/
+dsh-mem-state.json
