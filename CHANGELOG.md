@@ -1,5 +1,28 @@
 # 变更记录
 
+## v0.3.4 (2026-10-24) — 安装脚本支持三个后端 + 给智能体的说明
+
+### 新增
+- `ops/install.ps1 -Provider sqlserver|mysql|sqlite`
+  - SQLite：自动建 .db、跑 `sql/sqlite/*.sql`、写配置（零安装）
+  - MySQL：读口令文件 → 建库（utf8mb4）→ 跑 `sql/mysql/*.sql`
+  - SQL Server：保持原行为（sqlcmd）
+  - 新开关：`-SkipPlugin`（不装注入插件）、`-SkipDdl`（只写配置）
+- `AGENTS.md`：给其他 DSH / 编码智能体看的安装与验收说明（可执行步骤 + 四条硬判据 + 常见失败表）
+- `ops/doctor.ps1`：数据库检查改为**后端无关**（交给引擎判断）；队列检查只在 sqlserver 跑
+
+
+### 实测（2026-10-24）
+- `-Provider sqlite`：全新目录 → 建库（10 表 / 6 触发器）→ 副本 → `doctor` **RESULT: PASS**
+- `-Provider mysql`：配置生成 + 副本 + `doctor` **RESULT: PASS**（连的是已建好表的库；
+  完整 DDL 路径在测试机上卡在 `007` 的 `ERROR 1419`，因为那台 MySQL 开了 binlog 且账号无 SUPER ——
+  脚本现在会打印明确的解法，不再只丢一个 exit code）
+- `-Provider sqlserver`：脚本逻辑与原来一致（本机是生产库，未在此环境跑建表）
+
+### 有意为之
+- 安装脚本仍然**不联网下载**任何东西、不改系统安全设置
+- MySQL 口令只从文件读（不上命令行、不进历史）
+
 ## v0.3.3 (2026-10-24) — MySQL 5.7 复核发现的三个问题
 
 复核 MySQL 5.7.26 时发现的，全部修掉（**建议所有 MySQL 用户升级**）：
