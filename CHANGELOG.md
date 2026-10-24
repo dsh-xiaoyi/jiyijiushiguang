@@ -1,5 +1,29 @@
 # 变更记录
 
+## v0.3.2 (2026-10-24) — 紧急修复：v0.3.0/v0.3.1 会让 SQL Server 与 MySQL 配置启动即崩
+
+**如果你用 SQL Server 或 MySQL，请立刻升级到 v0.3.2。** v0.3.0/v0.3.1 在这两种配置下无法启动。
+
+### 根因
+v0.3.0 给 SQLite 加默认库路径时写错了变量名（`$ConfigPath` 应为 `$CfgPath`），
+而且那行代码对**所有**后端都会求值：
+
+```
+$script:SqliteDb = if ($cfg.sqliteDb) {...} else { Join-Path (Split-Path -Parent $ConfigPath) 'dsh-mem.db' }
+                                                                          ^^^^^^^^^^^^ 不存在 ⇒ 启动即报错
+Cannot bind argument to parameter 'Path' because it is null.
+```
+
+### 修复
+- 默认值只在 `provider = sqlite` 时计算，且变量名改对
+- 回归验证：**四种配置各跑一次** `version` 全部 OK ——
+  SQL Server（生产配置）/ MySQL 8.0.12 / MySQL 5.7.26 / SQLite
+
+### 顺带：MySQL 5.7 实测（由这次排查带来）
+- 5.7.26 上 `sql/mysql/001..007` 建库脚本**全部通过**：10 表、6 触发器、`utf8mb4_general_ci`
+- 引擎命令在 5.7.26 上：version / save / search / stats / roster / recent 通过
+- 长跑命令（backup / sync / prune）因测试机上的临时 5.7 实例反复掉线未能完成，**不算通过**
+
 ## v0.3.1 (2026-10-24) — SQLite 的 machines 注册修复
 
 复核 v0.3.0 时发现的**静默失败**：SQLite 后端 `roster` 永远显示 0 台机器。
