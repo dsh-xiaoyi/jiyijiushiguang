@@ -1,5 +1,23 @@
 # 变更记录
 
+## v0.3.3 (2026-10-24) — MySQL 5.7 复核发现的三个问题
+
+复核 MySQL 5.7.26 时发现的，全部修掉（**建议所有 MySQL 用户升级**）：
+
+### 1. `backup` 在 5.7 上产出不完整 dump（严重）
+8.0 的 `mysqldump` 去 dump 5.7 服务器时会查 `information_schema.COLUMN_STATISTICS`（8.0 才有），
+报 `Unknown table 'column_statistics'`，实际只写出 **1.9KB / 1 张表**就停了，而引擎只打印 WARN。
+修复：加 `--column-statistics=0`（且**必须放在 `--defaults-extra-file` 之后** ——
+该参数要求排第一，放错会报 `unknown variable 'defaults-extra-file=...'`）；客户端不支持时自动退回。
+实测：5.7 上 dump 从 1.9KB（1 表）变成 **287.6KB（10 表 + 6 触发器）**。
+
+### 2. `sync` 失败仍返回 0（静默成功）
+缺解压器时两个会话文件全部 FAILED，命令退出码依然是 0 —— 自动化脚本会当成成功。
+修复：任一文件失败 ⇒ 打印 `RESULT: FAILED - N session file(s)` 并 `exit 1`。
+
+### 3. 文档：mysqldump / mysql 客户端版本要匹配服务器
+写进 `docs/13-mysql-compatibility.md`。
+
 ## v0.3.2 (2026-10-24) — 紧急修复：v0.3.0/v0.3.1 会让 SQL Server 与 MySQL 配置启动即崩
 
 **如果你用 SQL Server 或 MySQL，请立刻升级到 v0.3.2。** v0.3.0/v0.3.1 在这两种配置下无法启动。
