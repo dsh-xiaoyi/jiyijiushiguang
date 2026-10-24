@@ -1,4 +1,4 @@
--- 001-core-tables.sql · 记忆核心表
+﻿-- 001-core-tables.sql · 记忆核心表
 -- MySQL 8.0 方言版本（记忆旧时光 · SQL Server 版的等价结构）
 --
 -- 约定：
@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS `messages` (
   `text`       LONGTEXT     NULL,
   `created_at` DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (`id`),
-  KEY `IX_messages_sess` (`session_id`, `seq`),
+  UNIQUE KEY `UQ_messages_sess` (`session_id`, `seq`),
   KEY `IX_messages_time` (`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
