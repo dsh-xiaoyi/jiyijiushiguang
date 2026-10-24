@@ -256,7 +256,19 @@ function ConvertTo-MySqlSql {
 function ConvertFrom-MySqlEscaped {
   param([string]$Text)
   if ($Text -eq '\N') { return $null }          # batch 模式的 NULL
-  return ($Text -replace '\\t', "`t" -replace '\\n', "`n" -replace '\\r', "`r" -replace '\\\\', '\' -replace "\\'", "'")
+  return [regex]::Replace($Text, '\\(.)', {
+        param($m)
+        $c = $m.Groups[1].Value
+        switch ($c) {
+            't' { "`t" }
+            'n' { "`n" }
+            'r' { "`r" }
+            '0' { [string][char]0 }
+            '\\' { '\' }
+            "'" { "'" }
+            default { $c }
+        }
+    })
 }
 
 function Invoke-MySqlCli {
