@@ -1,6 +1,16 @@
 # 变更记录
 
-## 未发布
+## v0.2.2 (2026-10-24) — MySQL 的 prune 修复 + 验收补记
+
+### 修复
+- MySQL 版 `prune`：`messages` 的只追加触发器会拦 DELETE（实测报 `ERROR 1644 messages is append-only: DELETE is not allowed`）
+  ⇒ 改为走维护模式（`SET @dsh_allow_mutation = 1` 后在**同一次连接**里删除）
+  实测：造一条 60 天前的消息 → `prune -Force 30` 删掉 1 条（270→269）→ 再跑显示 0 待删
+
+### 验收补记（MySQL）
+- `handoff` ✅ 只读；`recall` ✅ 无 embed 配置时明确降级（`[DEGRADED]`）并回落到字面检索
+- `embed` ⚠ 需要模型端点（本地 bge-m3 之类），未测；未配置时的报错可读
+
 
 ### 修复
 - MySQL 版 `prune`：`messages` 的只追加触发器会拦 DELETE ⇒ 改为走维护模式
