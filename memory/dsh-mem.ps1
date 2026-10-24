@@ -2069,10 +2069,27 @@ SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
     if (-not $Force) {
       Write-Host "  DRY RUN - 加 -Force 才真正执行"
     } else {
-      [void](Invoke-Exec -Sql "DELETE FROM dbo.messages WHERE created_at < @cut" -Params @{ '@cut' = $cut })
-      [void](Invoke-Exec -Sql "DELETE FROM dbo.sessions WHERE NOT EXISTS (SELECT 1 FROM dbo.messages m WHERE m.session_id = dbo.sessions.session_id)")
-      $s2 = Invoke-Rows -Sql "SELECT (SELECT COUNT(*) FROM dbo.messages) AS m,(SELECT COUNT(*) FROM dbo.sessions) AS s,(SELECT COUNT(*) FROM dbo.memories) AS k"
-      Write-Host ("  DONE - 现在: 消息 " + $s2[0].m + " / 会话 " + $s2[0].s + " / 记忆 " + $s2[0].k)
+      if ($script:Provider -eq 'mysql') {
+        # messages 有只追加触发器：删除必须走维护模式（变量随连接消失，不遗留）
+        $cutLit = ConvertTo-MySqlLiteral $cut
+        $pruneSql = @"
+SET @dsh_allow_mutation = 1;
+DELETE FROM messages WHERE created_at < $cutLit;
+DELETE FROM sessions WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.session_id = sessions.session_id);
+SELECT (SELECT COUNT(*) FROM messages) AS m, (SELECT COUNT(*) FROM sessions) AS s, (SELECT COUNT(*) FROM memories) AS k;
+"@
+        $outP = Invoke-MySqlScript -Sql $pruneSql -Db $script:Db
+        $numLine = @($outP | Where-Object { $_ -match '^\d' } | Select-Object -Last 1)
+        if ($numLine.Count -gt 0) {
+          $p3 = ([string]$numLine[0]) -split "`t"
+          Write-Host ("  DONE - 现在: 消息 " + $p3[0] + " / 会话 " + $p3[1] + " / 记忆 " + $p3[2])
+        }
+      } else {
+        [void](Invoke-Exec -Sql "DELETE FROM dbo.messages WHERE created_at < @cut" -Params @{ '@cut' = $cut })
+        [void](Invoke-Exec -Sql "DELETE FROM dbo.sessions WHERE NOT EXISTS (SELECT 1 FROM dbo.messages m WHERE m.session_id = dbo.sessions.session_id)")
+        $s2 = Invoke-Rows -Sql "SELECT (SELECT COUNT(*) FROM dbo.messages) AS m,(SELECT COUNT(*) FROM dbo.sessions) AS s,(SELECT COUNT(*) FROM dbo.memories) AS k"
+        Write-Host ("  DONE - 现在: 消息 " + $s2[0].m + " / 会话 " + $s2[0].s + " / 记忆 " + $s2[0].k)
+      }
       Write-Host ("  提示: 数据库文件不会自动缩小，如需回收空间可在主机上执行 DBCC SHRINKFILE（非必需）")
     }
   }
