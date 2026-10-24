@@ -121,10 +121,12 @@ $cfg = Read-TextFile $CfgPath | ConvertFrom-Json
 
 # ================= 数据库后端（sqlserver / mysql）=================
 $script:Provider = if ($cfg.provider) { ([string]$cfg.provider).Trim().ToLower() } else { 'sqlserver' }
-if (@('sqlserver', 'mysql') -notcontains $script:Provider) {
-  throw ("provider 只支持 sqlserver / mysql（当前: " + $script:Provider + "）")
+if (@('sqlserver', 'mysql', 'sqlite') -notcontains $script:Provider) {
+  throw ("provider 只支持 sqlserver / mysql / sqlite（当前: " + $script:Provider + "）")
 }
 $script:MySqlCliPath = if ($cfg.mysqlCliPath) { [string]$cfg.mysqlCliPath } else { 'mysql' }
+$script:SqliteCliPath = if ($cfg.sqliteCliPath) { [string]$cfg.sqliteCliPath } else { 'sqlite3' }
+$script:SqliteDb      = if ($cfg.sqliteDb)      { [string]$cfg.sqliteDb }      else { Join-Path (Split-Path -Parent $ConfigPath) 'dsh-mem.db' }
 
 # --- explicit version, so the cluster never has to infer it from a byte count again ------------
 # Lineage: 32174 (prune/handoff) -> 53025 (offline replica) -> 74605 (recall + embed half)
@@ -234,6 +236,9 @@ function ConvertTo-MySqlSql {
   #   所以 SQL Server 的 CONVERT(...)+'Z' 必须包成 CONCAT(...)。这个坑实测踩过。
   $s = [regex]::Replace($s, "(?is)(DATE_FORMAT\s*\([^()]*\))\s*\+\s*'Z'", "CONCAT(`$1, 'Z')")
   # N'...' → '...'
+  $s = [regex]::Replace($s, '(?i)\bLEFT\s*\(\s*([^,]+?)\s*,\s*(\d+)\s*\)', 'substr($1, 1, $2)')
+  $s = [regex]::Replace($s, '(?i)\bRIGHT\s*\(\s*([^,]+?)\s*,\s*(\d+)\s*\)', 'substr($1, -($2))')
+  $s = [regex]::Replace($s, '(?i)\bCHARINDEX\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)', 'instr($2, $1)')
   $s = [regex]::Replace($s, "(?i)\bN'", "'")
   # TOP (n) → LIMIT n（挪到语句末尾）
   # TOP 有两种写法：TOP (n) 和 TOP n —— 两种都要处理（engine 里都有）
@@ -382,7 +387,161 @@ function New-MySqlShim {
   return $shim
 }
 
+
+# ============================================================================
+#  SQLite 后端（v0.3.0）——与 mysql 一样走外部 CLI（sqlite3.exe），零 DLL 依赖
+# ============================================================================
+function ConvertTo-SqliteLiteral {
+  param($Value)
+  if ($null -eq $Value) { return 'NULL' }
+  if ($Value -is [bool]) { if ($Value) { return '1' } else { return '0' } }
+  if (($Value -is [int]) -or ($Value -is [long]) -or ($Value -is [double]) -or ($Value -is [decimal])) {
+    return $Value.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+  }
+  if ($Value -is [datetime]) { return ("'" + $Value.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fff") + "Z'") }
+  $t = [string]$Value
+  $t = $t.Replace("'", "''")
+  return ("'" + $t + "'")
+}
+
+function Get-SqliteNow { return "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))" }
+
+function ConvertTo-SqliteSql {
+  param([string]$Sql, [hashtable]$Params)
+  $s = $Sql
+  if ($Params -and $Params.Count -gt 0) {
+    foreach ($k in (@($Params.Keys) | Sort-Object Length -Descending)) {
+      $lit = ConvertTo-SqliteLiteral $Params[$k]
+      $pat = [regex]::Escape([string]$k) + '(?![A-Za-z0-9_])'
+      $s = [regex]::Replace($s, $pat, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $lit })
+    }
+  }
+  $now = Get-SqliteNow
+  if ($s -match '(?is)^\s*MERGE\s+(?:dbo\.)?machines') {
+    $m = [regex]::Match($s, '(?is)USING\s*\(\s*SELECT\s+(.+?)\s+AS\s+login_name\s*,\s*(.+?)\s+AS\s+machine(?:\s*,\s*(.+?)\s+AS\s+cli_version)?\s*\)')
+    if ($m.Success) {
+      $login = $m.Groups[1].Value.Trim()
+      $machine = $m.Groups[2].Value.Trim()
+      $ver = if ($m.Groups[3].Success) { $m.Groups[3].Value.Trim() } else { 'NULL' }
+      return ("INSERT INTO machines (login_name, machine, cli_version, first_seen, last_seen) VALUES (" + $login + ", " + $machine + ", " + $ver + ", " + $now + ", " + $now + ") ON CONFLICT(login_name) DO UPDATE SET machine = excluded.machine, cli_version = excluded.cli_version, last_seen = excluded.last_seen")
+    }
+  }
+  $s = $s -replace '\bdbo\.', ''
+  $s = [regex]::Replace($s, '(?i)\bISNULL\s*\(', 'IFNULL(')
+  $s = [regex]::Replace($s, '(?i)\bSYSUTCDATETIME\s*\(\s*\)', $now)
+  $s = [regex]::Replace($s, '(?i)\bGETUTCDATE\s*\(\s*\)', $now)
+  $s = [regex]::Replace($s, '(?i)\bLEN\s*\(', 'length(')
+  $s = [regex]::Replace($s, '(?i)\bDATALENGTH\s*\(', 'length(')
+  $login = if ($script:MyLoginName) { [string]$script:MyLoginName } else { [string]$env:USERNAME }
+  $s = [regex]::Replace($s, '(?i)\bSUSER_SNAME\s*\(\s*\)', [System.Text.RegularExpressions.MatchEvaluator]{ param($m) (ConvertTo-SqliteLiteral $login) })
+  $s = [regex]::Replace($s, '(?i)\bHOST_NAME\s*\(\s*\)', [System.Text.RegularExpressions.MatchEvaluator]{ param($m) (ConvertTo-SqliteLiteral $env:COMPUTERNAME) })
+  $s = [regex]::Replace($s, "(?is)CONVERT\s*\(\s*varchar\s*\(\s*\d+\s*\)\s*,\s*(.+?)\s*,\s*126\s*\)\s*\+\s*'Z'", "strftime('%Y-%m-%dT%H:%M:%fZ', `$1)")
+  $s = [regex]::Replace($s, '(?is)CONVERT\s*\(\s*varchar\s*\(\s*\d+\s*\)\s*,\s*(.+?)\s*,\s*126\s*\)', "strftime('%Y-%m-%dT%H:%M:%fZ', `$1)")
+  $s = [regex]::Replace($s, '(?is)DATEADD\s*\(\s*day\s*,\s*(-?\d+)\s*,\s*([^()]+?)\s*\)', "strftime('%Y-%m-%dT%H:%M:%fZ', `$2, '`$1 day')")
+  $s = [regex]::Replace($s, '(?i)\bLEFT\s*\(\s*([^,]+?)\s*,\s*(\d+)\s*\)', 'substr($1, 1, $2)')
+  $s = [regex]::Replace($s, '(?i)\bRIGHT\s*\(\s*([^,]+?)\s*,\s*(\d+)\s*\)', 'substr($1, -($2))')
+  $s = [regex]::Replace($s, "(?i)\bN'", "'")
+  $mt = [regex]::Match($s, '(?is)\bTOP\s*\(\s*([^)]+?)\s*\)')
+  if (-not $mt.Success) { $mt = [regex]::Match($s, '(?is)\bTOP\s+(\d+)\b') }
+  if ($mt.Success) {
+    $lim = $mt.Groups[1].Value.Trim()
+    $s = [regex]::Replace($s, '(?is)\bSELECT\s+TOP\s*(?:\(\s*[^)]+?\s*\)|\d+)\s+', 'SELECT ')
+    $s = $s.TrimEnd().TrimEnd(';') + ' LIMIT ' + $lim
+  }
+  return $s
+}
+
+function Invoke-SqliteCli {
+  param([string]$Sql)
+  $f = [System.IO.Path]::GetTempFileName() + '.sql'
+  try {
+    [System.IO.File]::WriteAllText($f, $Sql, (New-Object System.Text.UTF8Encoding $false))
+    $out = & cmd.exe /c ('"' + $script:SqliteCliPath + '" -batch "' + $script:SqliteDb + '" < "' + $f + '" 2>&1')
+    if ($LASTEXITCODE -ne 0) {
+      $msg = (@($out) | Where-Object { $_ }) -join ' | '
+      throw ('sqlite error ' + $LASTEXITCODE + ': ' + $msg)
+    }
+    return @($out)
+  } finally { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+}
+
+function ConvertTo-SqliteRows {
+  param([string[]]$RawLines)
+  $txt = ((@($RawLines) | Where-Object { $_ -ne $null }) -join "`n").Trim()
+  if (-not $txt) { return @() }
+  $start = $txt.LastIndexOf('[')
+  if ($start -lt 0) { return @() }
+  try { $arr = $txt.Substring($start) | ConvertFrom-Json } catch { return @() }
+  if ($null -eq $arr) { return @() }
+  # SQLite 把时间存成 TEXT（ISO8601 UTC）；这里统一转回 DateTime，下游才能 .ToLocalTime()
+  $out = @()
+  foreach ($o in @($arr)) {
+    $h = [ordered]@{}
+    foreach ($p in $o.PSObject.Properties) {
+      $v = $p.Value
+      if ($v -is [string] -and $v -match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z?$') {
+        $dt = [datetime]::MinValue
+        $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
+        if ([datetime]::TryParse(($v.TrimEnd('Z')), [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$dt)) { $v = $dt }
+      }
+      $h[$p.Name] = $v
+    }
+    $out += [pscustomobject]$h
+  }
+  return $out
+}
+
+function New-SqliteShim {
+  param([string]$Db)
+  $shim = [pscustomobject]@{ Database = $Db; Open_ = $false }
+  $shim | Add-Member -MemberType ScriptMethod -Name Open -Value { $this.Open_ = $true }
+  $shim | Add-Member -MemberType ScriptMethod -Name Close -Value { $this.Open_ = $false }
+  $shim | Add-Member -MemberType ScriptMethod -Name CreateCommand -Value {
+    $cmd = [pscustomobject]@{ CommandText = ''; CommandTimeout = 120; Params = @{} }
+    $cmd | Add-Member -MemberType ScriptMethod -Name ExecuteNonQuery -Value {
+      $sql = ConvertTo-SqliteSql -Sql $this.CommandText -Params $this.Params
+      $null = Invoke-SqliteCli -Sql $sql
+      return 1
+    }
+    $cmd | Add-Member -MemberType ScriptMethod -Name ExecuteReader -Value {
+      $sql = ConvertTo-SqliteSql -Sql $this.CommandText -Params $this.Params
+      $f = [System.IO.Path]::GetTempFileName() + '.sql'
+      $rows = @()
+      try {
+        [System.IO.File]::WriteAllText($f, $sql, (New-Object System.Text.UTF8Encoding $false))
+        $out = & cmd.exe /c ('"' + $script:SqliteCliPath + '" -json "' + $script:SqliteDb + '" < "' + $f + '" 2>&1')
+        if ($LASTEXITCODE -ne 0) { $msg = (@($out) | Where-Object { $_ }) -join ' | '; throw ('sqlite error ' + $LASTEXITCODE + ': ' + $msg) }
+        $rows = ConvertTo-SqliteRows -RawLines @($out)
+      } finally { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+      $names = @()
+      if (@($rows).Count -gt 0) { $names = @($rows[0].PSObject.Properties.Name) }
+      $rd = [pscustomobject]@{ Rows = @($rows); Names = $names; Index = -1 }
+      $rd | Add-Member -MemberType ScriptMethod -Name Read -Value { $this.Index++; return ($this.Index -lt @($this.Rows).Count) }
+      $rd | Add-Member -MemberType NoteProperty -Name FieldCount -Value (@($names).Count) -Force
+      $rd | Add-Member -MemberType ScriptMethod -Name GetName -Value { param($i) return [string]@($this.Names)[$i] }
+      $rd | Add-Member -MemberType ScriptMethod -Name GetValue -Value { param($i) $n = [string]@($this.Names)[$i]; return $this.Rows[$this.Index].$n }
+      $rd | Add-Member -MemberType ScriptMethod -Name Close -Value { }
+      return $rd
+    }
+    $paramsObj = [pscustomobject]@{}
+    $paramsObj | Add-Member -MemberType ScriptMethod -Name AddWithValue -Value {
+      param($name, $value)
+      $this.Owner.Params[[string]$name] = $value
+      return $null
+    }
+    $paramsObj | Add-Member -NotePropertyName Owner -NotePropertyValue $cmd
+    $cmd | Add-Member -MemberType NoteProperty -Name Parameters -Value $paramsObj
+    return $cmd
+  }
+  return $shim
+}
+
 function New-Cn([string]$db) {
+  if ($script:Provider -eq 'sqlite') {
+    $shim = New-SqliteShim -Db $script:SqliteDb
+    $shim.Open()
+    return $shim
+  }
   if ($script:Provider -eq 'mysql') {
     $shim = New-MySqlShim -Db $db
     $shim.Open()
@@ -395,6 +554,11 @@ function New-Cn([string]$db) {
 
 function Test-DbAlive {
   try {
+    if ($script:Provider -eq 'sqlite') {
+      if (-not (Test-Path -LiteralPath $script:SqliteDb)) { return $false }
+      $null = Invoke-SqliteCli -Sql 'SELECT 1;'
+      return $true
+    }
     if ($script:Provider -eq 'mysql') {
       $null = Invoke-MySqlCli -Sql 'SELECT 1' -Db $script:Db
       # 版本自查（每进程一次）：DATETIME(3) 需要 5.6.4+，低于此版本会静默丢毫秒
@@ -758,6 +922,53 @@ INSERT INTO sessions (session_id, machine, cwd, title, event_count, started_at, 
 VALUES (@sid, @machine, @cwd, @title, @cnt, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))
 ON DUPLICATE KEY UPDATE machine = VALUES(machine), cwd = VALUES(cwd), title = VALUES(title),
                         event_count = VALUES(event_count), last_seen_at = VALUES(last_seen_at)
+"@ -Params @{ '@sid' = $sid; '@machine' = [string]$env:COMPUTERNAME; '@cwd' = $cwd; '@title' = $sessTitle; '@cnt' = $events.Count })
+  } elseif ($script:Provider -eq 'sqlite') {
+    # SQLite 没有 SqlBulkCopy；但一次 CLI 调用就是一个连接，所以临时表能用。
+    # 整个写作阶段放进一次调用：临时表 → 归档 → upsert → 删除 → 计数。
+    # 只追加触发器靠 _guard_state.allow_mutation 放行，脚本末尾同一调用里复位。
+    $by      = [string]$env:COMPUTERNAME
+    $sidLit  = ConvertTo-SqliteLiteral $sid
+    $byLit   = ConvertTo-SqliteLiteral $by
+    $cmpOld  = "IFNULL(m.text,'') <> IFNULL(i.text,'') OR IFNULL(m.role,'') <> IFNULL(i.role,'') OR IFNULL(m.turn,-1) <> IFNULL(i.turn,-1)"
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('BEGIN;')
+    [void]$sb.AppendLine('CREATE TEMP TABLE _incoming (seq INTEGER NOT NULL, turn INTEGER, role TEXT NOT NULL, text TEXT, created_at TEXT NOT NULL);')
+    $batch = New-Object System.Collections.Generic.List[string]
+    foreach ($row in $dt.Rows) {
+      $turnLit = 'NULL'
+      if ($null -ne $row.turn -and [string]$row.turn -ne '') { $turnLit = [string][int]$row.turn }
+      $batch.Add('(' + [string][int64]$row.seq + ',' + $turnLit + ',' + (ConvertTo-SqliteLiteral ([string]$row.role)) + ',' + (ConvertTo-SqliteLiteral ([string]$row.text)) + ',' + (ConvertTo-SqliteLiteral ([datetime]$row.created_at)) + ')')
+      if ($batch.Count -ge 100) { [void]$sb.AppendLine('INSERT INTO _incoming VALUES ' + ($batch -join ',') + ';'); $batch.Clear() }
+    }
+    if ($batch.Count -gt 0) { [void]$sb.AppendLine('INSERT INTO _incoming VALUES ' + ($batch -join ',') + ';') }
+    [void]$sb.AppendLine("UPDATE _guard_state SET val = 1 WHERE key = 'allow_mutation';")
+    [void]$sb.AppendLine("SELECT (SELECT COUNT(*) FROM messages m LEFT JOIN _incoming i ON i.seq = m.seq WHERE m.session_id = $sidLit AND i.seq IS NULL) AS dropped, (SELECT COUNT(*) FROM messages m JOIN _incoming i ON i.seq = m.seq WHERE m.session_id = $sidLit AND ($cmpOld)) AS changed, (SELECT COUNT(*) FROM _incoming i WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.session_id = $sidLit AND m.seq = i.seq)) AS to_insert;")
+    [void]$sb.AppendLine("INSERT INTO messages_history (id, session_id, seq, turn, role, text, created_at, archive_reason, archived_by) SELECT m.id, m.session_id, m.seq, m.turn, m.role, m.text, m.created_at, CASE WHEN i.seq IS NULL THEN 'dropped' ELSE 'changed' END, $byLit FROM messages m LEFT JOIN _incoming i ON i.seq = m.seq WHERE m.session_id = $sidLit AND (i.seq IS NULL OR ($cmpOld));")
+    [void]$sb.AppendLine("INSERT INTO messages (session_id, seq, turn, role, text, created_at) SELECT $sidLit, i.seq, i.turn, i.role, i.text, i.created_at FROM _incoming i WHERE 1 ON CONFLICT(session_id, seq) DO UPDATE SET turn = excluded.turn, role = excluded.role, text = excluded.text, created_at = excluded.created_at;")
+      [void]$sb.AppendLine("DELETE FROM messages WHERE session_id = $sidLit AND seq NOT IN (SELECT seq FROM _incoming);")
+      [void]$sb.AppendLine("UPDATE _guard_state SET val = 0 WHERE key = 'allow_mutation';")
+    [void]$sb.AppendLine('COMMIT;')
+    try {
+      $outW = Invoke-SqliteCli -Sql ($sb.ToString())
+      $nums = @($outW | Where-Object { $_ -match '^\d' })
+      if ($nums.Count -ge 1) {
+        $pair = ([string]$nums[0]) -split '\|'
+        if ($pair.Count -ge 3) {
+          $archDropped = [int]$pair[0]
+          $archChanged = [int]$pair[1]
+          $updIns      = [int]$pair[2]
+        }
+      }
+      $updUpd = $archChanged
+      $updRem = $archDropped
+    } catch {
+      throw ("phase 1+2 write failed, refusing to touch this session's rows: " + $_.Exception.Message)
+    }
+    [void](Invoke-Exec -Sql @"
+  INSERT INTO sessions (session_id, machine, cwd, title, event_count, started_at, last_seen_at)
+  VALUES (@sid, @machine, @cwd, @title, @cnt, (strftime('%Y-%m-%dT%H:%M:%fZ','now')), (strftime('%Y-%m-%dT%H:%M:%fZ','now')))
+  ON CONFLICT(session_id) DO UPDATE SET machine = excluded.machine, cwd = excluded.cwd, title = excluded.title, event_count = excluded.event_count, last_seen_at = excluded.last_seen_at
 "@ -Params @{ '@sid' = $sid; '@machine' = [string]$env:COMPUTERNAME; '@cwd' = $cwd; '@title' = $sessTitle; '@cnt' = $events.Count })
   } else {
   $cnW = New-Cn $script:Db
@@ -1344,6 +1555,13 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf);
 SELECT LAST_INSERT_ID() AS id, CHAR_LENGTH(title) AS tlen, CHAR_LENGTH(IFNULL(body,'')) AS blen
 FROM memories WHERE id = LAST_INSERT_ID();
 "@ -Params $saveParams
+    } elseif ($script:Provider -eq 'sqlite') {
+      $res = Invoke-Rows -Sql @"
+INSERT INTO memories (scope, subject, kind, title, body, tags, source_session, confidence)
+VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf);
+SELECT last_insert_rowid() AS id, length(title) AS tlen, length(IFNULL(body,'')) AS blen
+FROM memories WHERE id = last_insert_rowid();
+"@ -Params $saveParams
     } else {
     $res = Invoke-Rows -Sql @"
 INSERT INTO dbo.memories (scope, subject, kind, title, body, tags, source_session, confidence)
@@ -1898,6 +2116,13 @@ SELECT (SELECT COUNT(*) FROM sessions) AS sessions,
        (SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 1)
           FROM information_schema.tables WHERE table_schema = DATABASE()) AS size_mb
 "@
+      } elseif ($script:Provider -eq 'sqlite') {
+      $s = Invoke-Rows -Sql @"
+SELECT (SELECT COUNT(*) FROM sessions) AS sessions,
+       (SELECT COUNT(*) FROM messages) AS messages,
+       (SELECT COUNT(*) FROM memories) AS memories,
+       printf('%.1f', ((SELECT * FROM pragma_page_count()) * (SELECT * FROM pragma_page_size())) / 1048576.0) AS size_mb
+"@
       } else {
       $s = Invoke-Rows -Sql @"
 SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
@@ -2084,6 +2309,16 @@ SELECT (SELECT COUNT(*) FROM messages) AS m, (SELECT COUNT(*) FROM sessions) AS 
           $p3 = ([string]$numLine[0]) -split "`t"
           Write-Host ("  DONE - 现在: 消息 " + $p3[0] + " / 会话 " + $p3[1] + " / 记忆 " + $p3[2])
         }
+      } elseif ($script:Provider -eq 'sqlite') {
+        # messages 有只追加触发器：删除必须走维护模式（同一次调用里开关+删除+复位）
+        $cutLit = ConvertTo-SqliteLiteral $cut
+        $pruneSql = "BEGIN; UPDATE _guard_state SET val = 1 WHERE key = 'allow_mutation'; DELETE FROM messages WHERE created_at < $cutLit; DELETE FROM sessions WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.session_id = sessions.session_id); SELECT (SELECT COUNT(*) FROM messages) AS m, (SELECT COUNT(*) FROM sessions) AS s, (SELECT COUNT(*) FROM memories) AS k; UPDATE _guard_state SET val = 0 WHERE key = 'allow_mutation'; COMMIT;"
+        $outP = Invoke-SqliteCli -Sql $pruneSql
+        $rowP = @($outP | Where-Object { $_ -match '^\d' })
+        if ($rowP.Count -gt 0) {
+          $p3 = ([string]$rowP[0]) -split '\|'
+          Write-Host ('  DONE - 现在: 消息 ' + $p3[0] + ' / 会话 ' + $p3[1] + ' / 记忆 ' + $p3[2])
+        }
       } else {
         [void](Invoke-Exec -Sql "DELETE FROM dbo.messages WHERE created_at < @cut" -Params @{ '@cut' = $cut })
         [void](Invoke-Exec -Sql "DELETE FROM dbo.sessions WHERE NOT EXISTS (SELECT 1 FROM dbo.messages m WHERE m.session_id = dbo.sessions.session_id)")
@@ -2161,6 +2396,20 @@ foreach ($r in @($mem)) {
         Write-Host ("  WARN full dump skipped: " + $_.Exception.Message)
         Write-Host ("       （需要 mysqldump 在 PATH，或配置 mysqldumpCliPath）")
       }
+    } elseif ($script:Provider -eq 'sqlite') {
+      $bak = Join-Path $bakDir ("dsh-memory_" + $stamp + ".db")
+      try {
+        if (-not (Test-Path -LiteralPath $bakDir)) { New-Item -ItemType Directory -Path $bakDir -Force | Out-Null }
+        # .backup 是 SQLite 的在线备份：WAL 模式下也能得到一致快照
+        $dot = ".backup '" + $bak + "'"
+        $outBk = & cmd.exe /c ('"' + $script:SqliteCliPath + '" "' + $script:SqliteDb + '" "' + $dot + '" 2>&1')
+        if ($LASTEXITCODE -ne 0) { throw ((@($outBk) | Where-Object { $_ }) -join ' ') }
+        $kb = [math]::Round((Get-Item -LiteralPath $bak).Length / 1KB, 1)
+        Write-Host ("  OK  sqlite .backup -> " + $bak + "  (" + $kb + " KB)")
+        Write-Host "  note: .db retention -> prune-backups.ps1 on this host (file-level)"
+      } catch {
+        Write-Host ("  WARN sqlite backup skipped: " + $_.Exception.Message)
+      }
     } else {
     $bak    = Join-Path $bakDir ("DSHMemory_" + $stamp + ".bak")
     try {
@@ -2175,7 +2424,8 @@ foreach ($r in @($mem)) {
       Write-Host ("  WARN full backup skipped: " + $_.Exception.Message)
     }
     }
-    $rows = Invoke-Rows -Sql "SELECT id, scope, subject, kind, title, body, tags, source_session, confidence, created_at, updated_at FROM dbo.memories ORDER BY id"
+    if (-not (Test-Path -LiteralPath $bakDir)) { New-Item -ItemType Directory -Path $bakDir -Force | Out-Null }
+  $rows = Invoke-Rows -Sql "SELECT id, scope, subject, kind, title, body, tags, source_session, confidence, created_at, updated_at FROM dbo.memories ORDER BY id"
     # redact per field, then check the serialised result before it reaches the disk
 foreach ($r in @($rows)) {
   # same reason as the replica: the JSON export is a plain file (see the .bak for the complete copy)
