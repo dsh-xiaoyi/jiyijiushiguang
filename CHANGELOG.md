@@ -54,7 +54,7 @@ Cannot bind argument to parameter 'Path' because it is null.
 
 ### 修复
 - `Register-Host` 增加**显式 SQLite 分支**：不再依赖 MERGE 翻译，SQL 用单行拼接（不用 here-string）
-- 验证：清空 machines → `save` → `roster` 出现 `Yang | 木易 | 1.3.4`
+- 验证：清空 machines → `save` → `roster` 出现 `<user> | <host> | 1.3.4`
 
 ### 复核（clean-room，从 v0.3.0 标签重建库）
 - 全新库：10 表 / 6 触发器 / 12 索引 / WAL / allow_mutation=0
