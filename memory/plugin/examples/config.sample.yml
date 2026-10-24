@@ -1,0 +1,22 @@
+# 记忆注入插件 · 最小配置样例
+# 以 bundle patch 方式引用插件时，把这些键放到插件配置块里即可。
+
+replicaPath: 'C:\\tools\\dsh-mem\\replica.json'   # 离线副本（JSON）
+cliPath:     'C:\\tools\\dsh-mem\\mem.ps1'        # 记忆 CLI（search / recent）
+conventionsPath: 'C:\\tools\\dsh-mem\\conventions.md'
+conventionsDir:  'C:\\tools\\dsh-mem\\conventions.d'
+
+# 容量
+maxChars: 16000          # 整块注入上限（字符，不是字节）
+conventionsMax: 8000     # 关键约定单独上限
+refreshMs: 60000         # 刷新周期
+shardCap: 3              # 分片最多注入几片
+
+# 语义检索（可选）
+semantic: true
+ollamaUrl: 'http://127.0.0.1:11434'
+embedModel: 'bge-m3'
+vectorPath: 'C:\\tools\\dsh-mem\\mem-vectors.bin'
+
+# 日志
+injectLogPath: 'C:\\tools\\dsh-mem\\logs\\inject.log'
