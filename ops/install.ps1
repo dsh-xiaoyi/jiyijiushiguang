@@ -195,7 +195,8 @@ function Invoke-SqliteDdl {
     if ($files.Count -eq 0) { throw ('没有找到 SQL 脚本: ' + $sqlDir) }
     foreach ($f in $files) {
         Say ('   - ' + $f.Name)
-        & cmd.exe /c ($cliArg + ' "' + $db + '" ".read ' + $f.FullName + '"')
+        $q = [string][char]34
+        & cmd.exe /c ($cliArg + ' "' + $db + '" ".read ' + $q + $f.FullName + $q + '"')
         if ($LASTEXITCODE -ne 0) { throw ('SQL 执行失败: ' + $f.Name + '（exit=' + $LASTEXITCODE + '）') }
     }
 }

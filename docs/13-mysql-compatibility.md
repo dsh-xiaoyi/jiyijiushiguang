@@ -1,4 +1,4 @@
-# MySQL / MariaDB 版本兼容说明
+﻿# MySQL / MariaDB 版本兼容说明
 
 > 一句话：**MySQL 5.6.4 及以上可用**；推荐 5.7 或 8.0；**实测环境是 8.0.12**。
 > MariaDB 10.2+ 理论可用（SIGNAL/触发器/ODKU 都支持），但我们**没有实测**，请自行验证。
@@ -95,3 +95,14 @@ mysql -uroot -p -e "SELECT @@character_set_server, @@collation_server;"
 两条纪律：
 1. **banner / 客户端握手** 只是服务端自报，写进对外文档前必须标注来源，或补一次实查。
 2. **工具链自带版本**（如 Python 内置 sqlite3）不等于目标机要求，不得写成"本项目要求 X"。
+### MySQL 升级提示（v0.3.8）
+
+`messages` 现在有 `UNIQUE KEY UQ_messages_sess (session_id, seq)`（与 SQLite 对齐）。
+**已有库需要手工加索引**（新装由 `sql/mysql/001` 自动建）：
+
+```sql
+-- 先确认没有重复行（有重复会失败，必须先处理）
+SELECT session_id, seq, COUNT(*) FROM messages GROUP BY session_id, seq HAVING COUNT(*) > 1;
+-- 无重复时执行
+ALTER TABLE messages ADD UNIQUE KEY UQ_messages_sess (session_id, seq);
+```
