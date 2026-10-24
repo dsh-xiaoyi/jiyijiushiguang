@@ -122,3 +122,11 @@ SELECT session_id, seq, COUNT(*) FROM messages GROUP BY session_id, seq HAVING C
 -- 无重复时执行
 ALTER TABLE messages ADD UNIQUE KEY UQ_messages_sess (session_id, seq);
 ```
+### 只追加保护的边界（v0.3.7 起）
+
+- SQLite 的 `INSERT OR REPLACE` 会绕过 `BEFORE DELETE` 触发器（REPLACE 冲突算法删旧行不触发触发器，
+  除非 `PRAGMA recursive_triggers=ON`）。v0.3.7 增加了 `BEFORE INSERT` 守卫
+  `trg_messages_no_dup_insert`：同键再插一律 `RAISE(ABORT)`，这条后门已堵。
+- `_guard_state.allow_mutation` 是**软开关**：SQLite 没有权限体系，任何能写库文件的进程都能置 1。
+  真正的边界是**库文件 ACL**。软开关只防"误改"，不防"有意改"。
+- 引擎调用 sqlite3 CLI 现在带 `-bail`：遇错即停，不会出现"部分执行后继续跑"。
