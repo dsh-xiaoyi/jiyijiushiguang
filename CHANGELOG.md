@@ -1,5 +1,28 @@
 # 变更记录
 
+## v0.3.0 (2026-10-24) — SQLite 版
+
+第三个后端：**单机零依赖** —— 一个 .db 文件就是整个记忆库，不装数据库、不开端口、不授权。
+
+### 新增
+- `provider: sqlite`：引擎走 sqlite3.exe CLI（与 mysql 后端同构，零 DLL 依赖）
+- `sql/sqlite/`：10 张表 + 6 个只追加触发器 + 自检脚本（时间统一 TEXT ISO8601 UTC 毫秒）
+- `docs/14-sqlite.md`：安装、配置、建库、差异表、安全边界、已知限制
+
+### 实测（sqlite3 3.50.4 / Windows）
+- 15 个命令：version / save / search / recent / history / secrets / stats / roster / replica /
+  backup / sync / prune / handoff / recall 全部通过；embed 需要模型端点（未测）
+- save：id 从 1 起，回读长度对平（title 10/10、body 45/45）
+- sync：337 帧 / 1.6MB → 267 行；再跑 inserted=0 updated=0 removed=0（幂等，无重复行）
+- backup：.backup 在线快照 144KB + memories-backup-*.json
+- prune -Force 30：删掉 1 条 60 天前的消息（268 → 删 1 → 再跑 0 待删）
+- replica：0.7KB，memories=2 / messages=1
+
+### 限制（写进文档，不藏）
+- 单文件，不能多机共享；并发写单写者
+- 库文件即明文（含 kind=secret 凭据）⇒ 必须收紧 ACL
+- 备份用 .backup，不要热拷正在写的 .db
+
 ## v0.2.2 (2026-10-24) — MySQL 的 prune 修复 + 验收补记
 
 ### 修复
