@@ -346,7 +346,9 @@ function ConvertTo-MySqlRows {
       $raw = if ($c -lt $cells.Count) { $cells[$c] } else { '' }
       $v = ConvertFrom-MySqlEscaped $raw
       if ($v -is [string] -and $v -match '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$') {
-        $v = [datetime]::SpecifyKind([datetime]::ParseExact(($v -replace '(\.\d+)$', ''), 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture), [System.DateTimeKind]::Utc)
+        $dv = [datetime]::MinValue
+                                if (-not [datetime]::TryParseExact($v, @('yyyy-MM-dd HH:mm:ss.fff','yyyy-MM-dd HH:mm:ss'), [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$dv)) { $dv = [datetime]::ParseExact(($v -replace '(\.\d+)$', ''), 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture) }
+                                $v = [datetime]::SpecifyKind($dv, [System.DateTimeKind]::Utc)
       }
       $h[$header[$c]] = $v
     }
@@ -761,10 +763,10 @@ $script:ColLimits = [ordered]@{
 function Assert-Length([string]$field, [string]$value, [int]$limit) {
   # Normalise JSON-escaped quotes/newlines and SQL placeholders: they survive redaction and
   # used to be counted as secrets (rules R31).
-  $t = $t -replace '\\u0027|\\u0022|\\n|\\r|\\t', ' '
+  $t = $value -replace '\\u0027|\\u0022|\\n|\\r|\\t', ' '
   $t = $t -replace '<PW>|<pw>|<password>|<secret>', ' '
   $n = 0
-  if ($value) { $n = $value.Length }
+  if ($t) { $n = $t.Length }
   if ($n -gt $limit) {
     # Never echo the value: the raw SQL error quoted the truncated title, which is exactly how a
     # fragment escapes into a terminal or a log file (same pattern as rule R6).
@@ -2416,7 +2418,7 @@ foreach ($r in @($mem)) {
           if (([string]$cfg.server) -match ',\s*(\d+)\s*$') { $lines[4] = 'port=' + $matches[1] }
           [System.IO.File]::WriteAllText($cnf, ($lines -join "`r`n"), (New-Object System.Text.ASCIIEncoding))
           $baseDumpArgs = @( ('--defaults-extra-file=' + $cnf),
-                             '--single-transaction', '--routines', '--triggers', '--no-tablespaces',
+                             '--single-transaction', '--routines', '--triggers', '--events', '--no-tablespaces',
                              '--set-gtid-purged=OFF', '--default-character-set=utf8mb4',
                              ('--result-file=' + $bak), $script:Db)
           # 8.0 的 mysqldump 会在 5.7 服务器上查 information_schema.COLUMN_STATISTICS（8.0 才有）
