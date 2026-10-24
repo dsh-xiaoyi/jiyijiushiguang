@@ -347,7 +347,7 @@ function ConvertTo-MySqlRows {
       $v = ConvertFrom-MySqlEscaped $raw
       if ($v -is [string] -and $v -match '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$') {
         $dv = [datetime]::MinValue
-                                if (-not [datetime]::TryParseExact($v, @('yyyy-MM-dd HH:mm:ss.fff','yyyy-MM-dd HH:mm:ss'), [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$dv)) { $dv = [datetime]::ParseExact(($v -replace '(\.\d+)$', ''), 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture) }
+                                if (-not [datetime]::TryParseExact($v, [string[]]@('yyyy-MM-dd HH:mm:ss.fff','yyyy-MM-dd HH:mm:ss'), [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$dv)) { $dv = [datetime]::ParseExact(($v -replace '(\.\d+)$', ''), 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture) }
                                 $v = [datetime]::SpecifyKind($dv, [System.DateTimeKind]::Utc)
       }
       $h[$header[$c]] = $v
