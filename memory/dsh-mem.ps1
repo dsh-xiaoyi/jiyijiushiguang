@@ -469,7 +469,7 @@ function Invoke-SqliteCli {
   $f = [System.IO.Path]::GetTempFileName() + '.sql'
   try {
     [System.IO.File]::WriteAllText($f, $Sql, (New-Object System.Text.UTF8Encoding $false))
-    $out = & cmd.exe /c ('"' + $script:SqliteCliPath + '" -batch "' + $script:SqliteDb + '" < "' + $f + '" 2>&1')
+    $out = & cmd.exe /c ('"' + $script:SqliteCliPath + '" -bail -batch "' + $script:SqliteDb + '" < "' + $f + '" 2>&1')
     if ($LASTEXITCODE -ne 0) {
       $msg = (@($out) | Where-Object { $_ }) -join ' | '
       throw ('sqlite error ' + $LASTEXITCODE + ': ' + $msg)
@@ -522,7 +522,7 @@ function New-SqliteShim {
       $rows = @()
       try {
         [System.IO.File]::WriteAllText($f, $sql, (New-Object System.Text.UTF8Encoding $false))
-        $out = & cmd.exe /c ('"' + $script:SqliteCliPath + '" -json "' + $script:SqliteDb + '" < "' + $f + '" 2>&1')
+        $out = & cmd.exe /c ('"' + $script:SqliteCliPath + '" -bail -json "' + $script:SqliteDb + '" < "' + $f + '" 2>&1')
         if ($LASTEXITCODE -ne 0) { $msg = (@($out) | Where-Object { $_ }) -join ' | '; throw ('sqlite error ' + $LASTEXITCODE + ': ' + $msg) }
         $rows = ConvertTo-SqliteRows -RawLines @($out)
       } finally { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
