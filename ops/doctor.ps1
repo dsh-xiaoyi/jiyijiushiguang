@@ -19,18 +19,18 @@ if (-not (Test-Path $ConfigPath)) { Bad ('配置不存在: ' + $ConfigPath); Wri
 $cfg = (Get-Content $ConfigPath -Raw | ConvertFrom-Json)
 Ok ('配置存在: ' + $ConfigPath)
 
-# 2) 数据库
+# 2) 数据库（三个后端通用：交给引擎自己判断）
 try {
-    $cs = 'Server=' + $cfg.server + ';Database=' + $cfg.database + ';TrustServerCertificate=True;Connect Timeout=8'
-    if ($cfg.user -and $cfg.password) { $cs += ';User Id=' + $cfg.user + ';Password=' + $cfg.password } else { $cs += ';Integrated Security=True' }
-    $cn = New-Object System.Data.SqlClient.SqlConnection $cs
-    $cn.Open()
-    $q = $cn.CreateCommand(); $q.CommandText = 'SELECT COUNT(*) FROM dbo.memories'
-    Info ('memories = ' + $q.ExecuteScalar())
-    $q2 = $cn.CreateCommand(); $q2.CommandText = 'SELECT COUNT(*) FROM dbo.messages'
-    Info ('messages = ' + $q2.ExecuteScalar())
-    $cn.Close()
-    Ok '数据库可连接'
+    $eng = Join-Path (Split-Path $PSScriptRoot -Parent) 'memory\dsh-mem.ps1'
+    if (-not (Test-Path $eng)) { throw ('找不到引擎: ' + $eng) }
+    $env:DSH_MEM_CONFIG = (Resolve-Path $ConfigPath).Path
+    $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $eng stats 2>&1 | Out-String
+    if ($out -match 'database unreachable') { throw 'database unreachable' }
+    $ms = [regex]::Match($out, 'messages\s*:\s*(\d+)')
+    $mm = [regex]::Match($out, 'memories\s*:\s*(\d+)')
+    if ($ms.Success) { Info ('messages = ' + $ms.Groups[1].Value) }
+    if ($mm.Success) { Info ('memories = ' + $mm.Groups[1].Value) }
+    Ok ('数据库可连接（provider=' + $cfg.provider + '）')
 } catch { Bad ('数据库不可用: ' + $_.Exception.Message.Split("`n")[0]) }
 
 # 3) 离线副本新鲜度
@@ -54,14 +54,18 @@ if ($procs.Count -gt 0) {
     if ($ports.Count -gt 0) { Ok ('DSH 监听端口: ' + ($ports -join ',')) } else { Bad 'DSH 在跑但没有监听端口' }
 } else { Info 'DSH 未运行（若刚装完属正常）' }
 
-# 6) 队列积压
-try {
-    $cs = 'Database=' + $cfg.database + ';Server=' + $cfg.server + ';Trusted_Connection=True;TrustServerCertificate=True;Connect Timeout=8'
-    $cn = New-Object System.Data.SqlClient.SqlConnection $cs; $cn.Open()
-    $q = $cn.CreateCommand(); $q.CommandText = 'SELECT COUNT(*) FROM dbo.agent_messages WHERE delivered_at IS NULL'
-    $n = [int]$q.ExecuteScalar(); $cn.Close()
-    if ($n -le 5) { Ok ('队列在途 = ' + $n) } else { Bad ('队列积压 = ' + $n) }
-} catch { Info '队列表不存在（未启用青鸟时可忽略）' }
+# 6) 队列积压（只有 SQL Server 版有 agent_messages 表）
+if ($cfg.provider -and $cfg.provider -ne 'sqlserver') {
+    Info ('队列检查跳过（provider=' + $cfg.provider + '；mysql/sqlite 版没有 agent_messages 表）')
+} else {
+    try {
+        $cs = 'Database=' + $cfg.database + ';Server=' + $cfg.server + ';Trusted_Connection=True;TrustServerCertificate=True;Connect Timeout=8'
+        $cn = New-Object System.Data.SqlClient.SqlConnection $cs; $cn.Open()
+        $q = $cn.CreateCommand(); $q.CommandText = 'SELECT COUNT(*) FROM dbo.agent_messages WHERE delivered_at IS NULL'
+        $n = [int]$q.ExecuteScalar(); $cn.Close()
+        if ($n -le 5) { Ok ('队列在途 = ' + $n) } else { Bad ('队列积压 = ' + $n) }
+    } catch { Info '队列表不存在（未启用青鸟时可忽略）' }
 
+}
 Write-Output ('RESULT: ' + $(if ($fail -eq 0) { 'PASS' } else { 'FAIL' }))
 if ($fail -gt 0) { exit 3 }

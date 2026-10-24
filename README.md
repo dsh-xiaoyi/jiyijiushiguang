@@ -37,6 +37,20 @@ SQL Server（Express 免费版即可）—— 建表时需要一次 sysadmin
 Windows 7 用户：需先装 WMF 5.1（系统自带的是 PowerShell 2.0），否则脚本无法运行
 ```
 
+## 一键安装（三个后端任选）
+
+```powershell
+# SQLite（零安装，最省事）
+powershell -ExecutionPolicy Bypass -File .\ops\install.ps1 -Provider sqlite -SqliteDb C:\dsh-mem\data\dsh-mem.db
+# MySQL（口令放文件，别上命令行）
+powershell -ExecutionPolicy Bypass -File .\ops\install.ps1 -Provider mysql -MySqlServer 127.0.0.1,3306 -MySqlPasswordFile C:\temp\pw.txt
+# SQL Server（默认）
+powershell -ExecutionPolicy Bypass -File .\ops\install.ps1 -Provider sqlserver -SqlServer 127.0.0.1,1433 -Database DSHMemory
+```
+
+> 给智能体/自动化用的详细步骤与判定标准见 [AGENTS.md](AGENTS.md)。
+> 下面是 SQL Server 的手动步骤（其它后端见 docs/13、docs/14）。
+
 ## 5 分钟跑起来（Windows + SQL Server）
 
 ```powershell
