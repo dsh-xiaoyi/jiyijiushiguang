@@ -1,5 +1,26 @@
 # 变更记录
 
+## v0.3.1 (2026-10-24) — SQLite 的 machines 注册修复
+
+复核 v0.3.0 时发现的**静默失败**：SQLite 后端 `roster` 永远显示 0 台机器。
+
+### 根因（两层）
+1. `Register-Host` 走的是 SQL Server 的 `MERGE` 分支，靠翻译层改写成 `ON CONFLICT`；
+   失败时被 `catch { }` 吞掉，**写入 0 行也不报错**。
+2. 我给 SQLite 补的分支里用了 here-string，而 PowerShell 要求终止符 `"@` **顶格**，
+   我生成时带缩进 ⇒ 语句被吞、行为不可预期（同一天在 sync 上也踩过一次）。
+
+### 修复
+- `Register-Host` 增加**显式 SQLite 分支**：不再依赖 MERGE 翻译，SQL 用单行拼接（不用 here-string）
+- 验证：清空 machines → `save` → `roster` 出现 `Yang | 木易 | 1.3.4`
+
+### 复核（clean-room，从 v0.3.0 标签重建库）
+- 全新库：10 表 / 6 触发器 / 12 索引 / WAL / allow_mutation=0
+- 15 个命令：14 通过（embed 需模型端点）
+- 独立断言（直接查库）：messages=267、**重复行=0**、sessions=2、memories=1、**machines=1**
+- 只追加：默认拦 UPDATE（`messages is append-only`）；维护模式放行后 267 行完好
+- 备份 144KB + JSON 0.4KB；副本 0.4KB
+
 ## v0.3.0 (2026-10-24) — SQLite 版
 
 第三个后端：**单机零依赖** —— 一个 .db 文件就是整个记忆库，不装数据库、不开端口、不授权。

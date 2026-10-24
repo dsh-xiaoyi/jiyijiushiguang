@@ -638,6 +638,22 @@ function Register-Host {
   # SQL Server itself, so a machine cannot claim to be another one.
   # cli_version is what makes "unified version" checkable from the database host instead of by
   # comparing byte counts (memory [177]/[178] got that wrong twice in one hour).
+  if ($script:Provider -eq 'sqlite') {
+    # SQLite：显式分支。SQL 用**单行拼接**而不是 here-string ——
+    # here-string 的终止符必须顶格，缩进写会让它吞掉后面的代码（实测踩过：静默 0 行）。
+    $login = if ($env:USERNAME) { $env:USERNAME } else { 'local' }
+    $nowSql = "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+    try {
+      $sqlReg = "INSERT INTO machines (login_name, machine, cli_version, first_seen, last_seen) VALUES (@l, @m, @v, " + $nowSql + ", " + $nowSql + ") ON CONFLICT(login_name) DO UPDATE SET machine = excluded.machine, cli_version = excluded.cli_version, last_seen = excluded.last_seen"
+      [void](Invoke-Exec -Sql $sqlReg -Params @{ '@l' = $login; '@m' = $env:COMPUTERNAME; '@v' = $script:CliVersion })
+    } catch {
+      try {
+        $sqlReg2 = "INSERT INTO machines (login_name, machine, first_seen, last_seen) VALUES (@l, @m, " + $nowSql + ", " + $nowSql + ") ON CONFLICT(login_name) DO UPDATE SET machine = excluded.machine, last_seen = excluded.last_seen"
+        [void](Invoke-Exec -Sql $sqlReg2 -Params @{ '@l' = $login; '@m' = $env:COMPUTERNAME })
+      } catch { }
+    }
+    return
+  }
   if ($script:Provider -eq 'mysql') {
     # MySQL 没有 MERGE：用 INSERT ... ON DUPLICATE KEY UPDATE。
     # 身份取"实际的数据库账号 + 本机名"，这两项由连接本身决定，不是调用方随便写的字符串。
