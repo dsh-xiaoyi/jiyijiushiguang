@@ -1506,8 +1506,11 @@ switch ($Command.ToLower()) {
       Write-Host ("syncing $($files.Count) session file(s)...")
       foreach ($f in $files) {
         Write-Host ("--- " + $f.FullName)
-        try { Invoke-Sync -SessionFile $f.FullName } catch { Write-Host ("  FAILED: " + $_.Exception.Message) }
+        $syncFailed = 0
+        try { Invoke-Sync -SessionFile $f.FullName } catch { Write-Host ("  FAILED: " + $_.Exception.Message); $syncFailed++ }
       }
+        # 失败必须让调用方看得见：原来 FAILED 也返回 0（实测：缺解压器时全失败、退出码仍是 0）
+        if ($syncFailed -gt 0) { Write-Host ("  RESULT: FAILED - " + $syncFailed + " session file(s) could not be imported"); exit 1 }
     } else {
       if (-not $Target) {
         $Target = Get-ChildItem $cfg.sessionsRoot -Recurse -File -Force -ErrorAction SilentlyContinue |
@@ -2400,12 +2403,22 @@ foreach ($r in @($mem)) {
                      'port=3306')
           if (([string]$cfg.server) -match ',\s*(\d+)\s*$') { $lines[4] = 'port=' + $matches[1] }
           [System.IO.File]::WriteAllText($cnf, ($lines -join "`r`n"), (New-Object System.Text.ASCIIEncoding))
-          $dumpArgs = @(('--defaults-extra-file=' + $cnf),
-                        '--single-transaction', '--routines', '--triggers', '--no-tablespaces',
-                        '--set-gtid-purged=OFF', '--default-character-set=utf8mb4',
-                        ('--result-file=' + $bak), $script:Db)
+          $baseDumpArgs = @( ('--defaults-extra-file=' + $cnf),
+                             '--single-transaction', '--routines', '--triggers', '--no-tablespaces',
+                             '--set-gtid-purged=OFF', '--default-character-set=utf8mb4',
+                             ('--result-file=' + $bak), $script:Db)
+          # 8.0 的 mysqldump 会在 5.7 服务器上查 information_schema.COLUMN_STATISTICS（8.0 才有）
+          # ⇒ 实测报 Unknown table 并留下 1.9KB 残包；先带 --column-statistics=0，失败则退回（兼容 5.7 客户端）
+          # ★ --defaults-extra-file 必须是**第一个**参数（mysql/mysqldump 的硬要求）；
+#   放到 --column-statistics=0 之后会被当成配置文件里的变量，报 unknown variable 'defaults-extra-file=...'
+$dumpArgs = @($baseDumpArgs[0], '--column-statistics=0') + $baseDumpArgs[1..($baseDumpArgs.Count - 1)]
           $null = & $dumpCli @dumpArgs 2>&1
-          if ($LASTEXITCODE -ne 0) { throw ('mysqldump exit ' + $LASTEXITCODE) }
+          if ($LASTEXITCODE -ne 0) {
+            if (Test-Path -LiteralPath $bak) { Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue }
+            $dumpArgs = $baseDumpArgs
+            $null = & $dumpCli @dumpArgs 2>&1
+            if ($LASTEXITCODE -ne 0) { throw ('mysqldump exit ' + $LASTEXITCODE) }
+          }
           $kb = [math]::Round((Get-Item -LiteralPath $bak).Length / 1KB, 1)
           Write-Host ("  OK  full dump -> " + $bak + "  (" + $kb + " KB)")
         } finally { Remove-Item -LiteralPath $cnf -Force -ErrorAction SilentlyContinue }
