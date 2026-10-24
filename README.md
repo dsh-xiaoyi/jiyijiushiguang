@@ -7,6 +7,14 @@
 
 > 第一次读到这里，不必一次记住；先照着跑一遍，遇到问题再回来查对应那一节。
 
+> **后端成熟度（2026-10-24）**
+> - **SQL Server**：功能 ✅ ／ **长期运行 ✅ 已验证**（生产环境连续数周）
+> - **MySQL（5.7 / 8.0）**：功能 ✅（15 命令 + 独立断言）／ **长期运行 ⚠️ 未验证**
+> - **SQLite（3.33+）**：功能 ✅（同上）／ **长期运行 ⚠️ 未验证**
+>
+> 也就是说：MySQL 与 SQLite 后端**现在就能用**，但"连续跑几周不出问题"还没有时间证明。
+> 细节见 [docs/16-long-term-notes](docs/16-long-term-notes.md)。
+
 ---
 
 ## 它解决什么问题
@@ -78,7 +86,7 @@ powershell -File memory\dsh-mem.ps1 search 记忆
 
 > 本仓库**不包含**任何常驻服务/闭源程序：刷新要么靠计划任务，要么靠插件自触发，二选一即可。
 
-## MySQL 版怎么装（v0.2.0 · 建表已验证）
+## MySQL 版怎么装（v0.3.3 · 5.7 / 8.0 已验证；长期运行未验证）
 
 ```
 版本要求：MySQL 5.6.4+（推荐 5.7 / 8.0；8.4+ 见下方"认证插件"一行）
@@ -105,7 +113,9 @@ mysql --defaults-extra-file=my.cnf -t dsh_memory < sql/mysql/009-verify.sql
 ```
 
 > ⚠ 安全：账号、端口、备份、字符集这几件事请先看 [docs/12-mysql-security](docs/12-mysql-security.md)。
-> SQLite 版的边界更物理（文件权限就是全部安全边界），见 [docs/14-sqlite](docs/14-sqlite.md)。\n> 验收时请按 [docs/15-verification-checklist](docs/15-verification-checklist.md) 自己查库 —— 引擎说"OK"不算证据。\n> 打算长期运行的话，先看 [docs/16-long-term-notes](docs/16-long-term-notes.md)（哪些能放心用、哪些还没验证、小机器怎么配）。
+> SQLite 版的边界更物理（文件权限就是全部安全边界），见 [docs/14-sqlite](docs/14-sqlite.md)。
+> 验收时请按 [docs/15-verification-checklist](docs/15-verification-checklist.md) 自己查库 —— 引擎说「OK」不算证据。
+> 打算长期运行的话，先看 [docs/16-long-term-notes](docs/16-long-term-notes.md)（哪些能放心用、哪些还没验证、小机器怎么配）。
 
 实测环境：**MySQL 8.0.12（Windows）**，10 张表 + 6 个只追加触发器全部建成；
 `UPDATE/DELETE messages` 会被触发器拦住（SQLSTATE 45000），`UPDATE memories` 正常放行。
@@ -114,7 +124,7 @@ mysql --defaults-extra-file=my.cnf -t dsh_memory < sql/mysql/009-verify.sql
 
 ```
 memory\     引擎（dsh-mem.ps1）+ 注入插件（plugin\）+ 约定模板（conventions.example.md）
-sql\        建表脚本，按数据库分目录：sqlserver\（现在）· sqlite\（计划）· mysql\（计划）
+sql\        建表脚本，按数据库分目录：sqlserver\ · mysql\ · sqlite\（三套都已验证）
 ops\        install.ps1（一键装）/ doctor.ps1（体检）/ secret-scan.ps1（发布前扫描）
 examples\   config.example.json（占位值）
 docs\       为什么做 / 记忆设计（含三层缺陷复盘）/ 复盘集 / 权限与安全软件
@@ -122,11 +132,11 @@ docs\       为什么做 / 记忆设计（含三层缺陷复盘）/ 复盘集 / 
 
 ## 数据库支持（重要）
 
-| 数据库 | 状态 | 适合谁 |
-|---|---|---|
-| **SQL Server** | ✅ 本仓库当前版本 | 已有 SQL Server 授权的人 |
-| **MySQL** | ✅ v0.2.0 已支持（10 表 + 6 触发器 + sync/备份全部实测） | 多机共享、又不想买 SQL Server 授权的人 |
-| **SQLite** | ⏳ 计划中（v0.3.0） | 单机用户：零安装、零授权、一个文件 |
+| 数据库 | 功能 | 长期运行 | 适合谁 |
+|---|---|---|---|
+| **SQL Server** | ✅ v0.1.0 | ✅ 已验证（生产连续数周） | 已有 SQL Server 授权的人 |
+| **MySQL 5.7 / 8.0** | ✅ v0.3.3（15 命令 + 独立断言） | ⚠️ **未做长期测试** | 多机共享、又不想买 SQL Server 授权的人 |
+| **SQLite 3.33+** | ✅ v0.3.3（15 命令 + 独立断言） | ⚠️ **未做长期测试** | 单机用户：零安装、零授权、一个文件 |
 
 
 > 我们自己的集群仍跑 SQL Server，不切换；SQLite/MySQL 会作为**独立版本**开发、测试通过后再发布。
