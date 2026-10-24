@@ -760,13 +760,22 @@ $script:ColLimits = [ordered]@{
   source_session = 64
 }
 
+function Get-CodePointLength([string]$text) {
+    # DB 侧 CHAR_LENGTH()/length() 按码点计数；.NET 的 .Length 按 UTF-16 码元（代理对算 2）。
+    # 用码点数与之对齐，否则含 emoji 的标题/正文会被误报"长度不一致"。
+    if (-not $text) { return 0 }
+    $n = 0
+    foreach ($ch in $text.ToCharArray()) { if (-not [char]::IsLowSurrogate($ch)) { $n++ } }
+    return $n
+}
+
 function Assert-Length([string]$field, [string]$value, [int]$limit) {
   # Normalise JSON-escaped quotes/newlines and SQL placeholders: they survive redaction and
   # used to be counted as secrets (rules R31).
   $t = $value -replace '\\u0027|\\u0022|\\n|\\r|\\t', ' '
   $t = $t -replace '<PW>|<pw>|<password>|<secret>', ' '
   $n = 0
-  if ($t) { $n = $t.Length }
+  if ($t) { $n = Get-CodePointLength $t }
   if ($n -gt $limit) {
     # Never echo the value: the raw SQL error quoted the truncated title, which is exactly how a
     # fragment escapes into a terminal or a log file (same pattern as rule R6).
@@ -1554,8 +1563,8 @@ switch ($Command.ToLower()) {
     }
     if (-not $Title) { throw "save requires -Title or -TitleFile" }
 
-    $inTitleLen = $Title.Length
-    $inBodyLen  = ([string]$Body).Length
+    $inTitleLen = Get-CodePointLength $Title
+    $inBodyLen  = Get-CodePointLength ([string]$Body)
 # OWNER-AUTHORISED CREDENTIAL STORE (rules R39, user decision 2026-10-07).  kind='secret' is the one
 # deliberate exception to "never store a secret in this database": the owner asked for their own
 # passwords to live here so they are not forgotten.  Every other kind is still redacted on write.
