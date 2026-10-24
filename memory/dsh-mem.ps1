@@ -126,7 +126,8 @@ if (@('sqlserver', 'mysql', 'sqlite') -notcontains $script:Provider) {
 }
 $script:MySqlCliPath = if ($cfg.mysqlCliPath) { [string]$cfg.mysqlCliPath } else { 'mysql' }
 $script:SqliteCliPath = if ($cfg.sqliteCliPath) { [string]$cfg.sqliteCliPath } else { 'sqlite3' }
-$script:SqliteDb      = if ($cfg.sqliteDb)      { [string]$cfg.sqliteDb }      else { Join-Path (Split-Path -Parent $ConfigPath) 'dsh-mem.db' }
+# ★ 只有 sqlite 后端才需要这个默认值；其它后端不该走 Split-Path（变量名写错会让 ALL 配置启动即崩）
+$script:SqliteDb      = if ($cfg.sqliteDb) { [string]$cfg.sqliteDb } elseif ($script:Provider -eq 'sqlite') { Join-Path (Split-Path -Parent $CfgPath) 'dsh-mem.db' } else { $null }
 
 # --- explicit version, so the cluster never has to infer it from a byte count again ------------
 # Lineage: 32174 (prune/handoff) -> 53025 (offline replica) -> 74605 (recall + embed half)
