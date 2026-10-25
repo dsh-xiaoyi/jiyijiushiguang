@@ -61,3 +61,16 @@
 · 时间统一 UTC：引擎每次调用都会带 --init-command=SET time_zone='+00:00'
 · 建表脚本在 sql/mysql/，建表前先跑 007-append-only.sql 需要的权限说明见该文件头部
 ```
+
+## state / anchor（0.5.1 新增）
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `stateDir` | `C:\dsh-mem\sessions` | 会话状态文件所在目录；目录不存在则跳过该段 |
+| `stateCards` | `3` | 最多注入几张状态卡（按最近更新排序） |
+| `stateMaxChars` | `2400` | `state` 段字符上限 |
+| `anchorPath` | `C:\dsh-mem\anchors\LATEST.md` | 锚点清单文件；文件不存在则跳过该段 |
+| `anchorMaxChars` | `900` | `anchor` 段字符上限 |
+
+> 两段都受全局预算缩放（`budgetScale`）与下限（`BUDGET_FLOOR`）约束；
+> 段被截断时会在注入内容里显式标注省略数量，不静默丢弃。

@@ -1,8 +1,46 @@
 # CHANGELOG — dsh-memory-bridge
 
-> 状态：**未发布**（2026-10-24 起内部验收中；验收通过后再决定是否开源/发版）
+> 状态：**已开源**（0.5.0 起内部验收通过；0.5.1 对外发布）
 > 命名：v0.5.0 对应"记忆插件 v2"改造（A/B/C 三阶段）
 
+## [0.5.1] — 2026-10-25（开源发布）
+
+### 新增：让记忆**可追溯**，而不只是可注入
+
+- **状态卡（state card）**：从 `stateDir`（默认 `C:\dsh-mem\sessions`）读取最近更新的会话状态文件，
+  取最新 `stateCards`（默认 3）张、每张上限 `stateMaxChars`（默认 2400 字符），注入 `state` 段。
+  用于跨会话接手时先看到"上次做到哪、下一步是什么"。
+- **锚点指针（anchor pointers）**：从 `anchorPath`（默认 `C:\dsh-mem\anchors\LATEST.md`）取最新锚点
+  （`session` + `seq` 指针），上限 `anchorMaxChars`（默认 900 字符），注入 `anchor` 段。
+  给出可回读的原文指针，避免模型复述失真；配合 `mem-read` 类工具即可按指针回读原文。
+
+### 修复（发布前自测拦下的两个真问题）
+
+- **显式 `cliPath` 不存在时不再静默回退**：旧行为会退到候选里真实存在的
+  `…\dsh-mem.ps1`，导致"以为在跑隔离自测、其实写进了真实记忆库"。
+  现在记 `CLI-MISSING` 并拒绝执行（显式配置优先）。
+- **`verify.mjs` 改用临时 no-op stub CLI**：原实现给一个"不存在的 cliPath"，
+  触发上述回退 ⇒ 自测等待 3 秒拿不到 exit（真 CLI 写库要 1–2 秒）⇒ 永远 `FAIL(6)`，
+  且假记录（`session-00000000-dead-beef…`）被写进库里。修后自测稳定 `RESULT: PASS`，
+  且不再触碰任何数据库。
+### 预算再平衡（新增两段后）
+
+```
+SEC_BUDGET  conv 8000 ｜ shards 2600 ｜ state 2400 ｜ anchor 900 ｜ recall 1600
+            ｜ pinned 1200 ｜ recent 2000 ｜ activity 700 ｜ hints 400
+BUDGET_FLOOR shards 700 ｜ state 1200 ｜ anchor 350 ｜ recall 500 ｜ pinned 350
+            ｜ recent 450 ｜ activity 250 ｜ hints 300
+```
+
+超限时的丢弃顺序仍为 `recent → activity → pinned → shards → recall`，**不先砍 hints**。
+
+### 安全与脱敏
+
+- 对外发布前已移除示例中的本地地址与主机标识：`ollamaUrl` 默认值改为 `127.0.0.1`，
+  示例文案不再包含具体主机名/GPU 型号；真实地址一律由配置提供。
+- `docs/08-permissions-and-antivirus.md` 中的示例路径改为 `C:\Users\<用户名>` 形式。
+
+---
 ## [0.5.0] — 2026-10-24（内部，未发布）
 
 ### 注入契约（A + B1/B2）
