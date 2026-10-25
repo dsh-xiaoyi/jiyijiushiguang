@@ -47,7 +47,7 @@ import os, { tmpdir } from 'node:os'   // 2026-10-25 修：之前只取了 tmpdi
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-export const VERSION = '0.5.0'
+export const VERSION = '0.5.1'
 export const name = 'dsh-memory-bridge'
 export const inject = ['systemPrompt']
 
@@ -165,6 +165,13 @@ export function apply(ctx, config) {
   const recallTop    = Number(config.recallTop || 4)
   const maxChars = Number(config.maxChars || 16000) // 2026-10-24 r5: 默认=推荐值 16000（默认 12000 < 必需 13550 ⇒ 空配置即拒启）
   const conventionsMax = Number(config.conventionsMax || 8000) // 2026-10-24: 3000 太小会静默截断 §8+；提到 8000
+  // 2026-10-25 state card: inject the most recently updated session state files
+  const stateDir = String(config.stateDir || 'C:\\dsh-mem\\sessions')
+  const stateMaxChars = Number(config.stateMaxChars || 2400)
+  const stateCards = Number(config.stateCards || 3)
+  // 2026-10-25 anchor pointers: inject the freshest exact anchors (session + seq) for lossless readback
+  const anchorPath = String(config.anchorPath || 'C:\\dsh-mem\\anchors\\LATEST.md')
+  const anchorMaxChars = Number(config.anchorMaxChars || 900)
   const conventionsDir = pickExisting(config.conventionsDir || 'C:\\dsh-mem\\conventions.d',
     PATH_CANDIDATES.map(function (d) { return d + '\\conventions.d' }), 'conventions.d') // 可选分片：按关键词命中才注入
   const injectLogPath = config.injectLogPath || 'C:\\dsh-mem\\logs\\inject.log'
@@ -367,13 +374,13 @@ export function apply(ctx, config) {
           ' ｜ 管理员组(SID 544) ' + (SELF_ID.admin === null ? '未知' : (SELF_ID.admin ? '是' : '否')))
       }
       // 2026-10-24 B1/B2：分区渲染（每段独立预算 + 全局去重 + 显式省略清单）
-      const SECTIONS = { recall: [], conv: [], shards: [], activity: [], hints: [], pinned: [], recent: [] }
-      const SEC_BUDGET = { conv: 8000, shards: 2600, recall: 1600, pinned: 1200, recent: 2000, activity: 700, hints: 400 }
+      const SECTIONS = { recall: [], conv: [], shards: [], state: [], anchor: [], activity: [], hints: [], pinned: [], recent: [] }
+      const SEC_BUDGET = { conv: 8000, shards: 2600, state: 2400, anchor: 900, recall: 1600, pinned: 1200, recent: 2000, activity: 700, hints: 400 }
       // 2026-10-24 修（17/18 复核 R3-⑤ 证实）：各段预算之和 16500 > maxChars 16000，
       //   尾部（hints=怎么查记忆）被全局截断吃掉，日志却还写着 hints=281（"有数字没送达"的假绿）。
       //   做法：conv 之外各段按 maxChars*0.95 - conventionsMax 等比缩放，并给每段设下限。
-      const BUDGET_FLOOR = { shards: 700, recall: 500, pinned: 350, recent: 450, activity: 250, hints: 300 }
-      const scaledSections = ['shards', 'recall', 'pinned', 'recent', 'activity', 'hints']
+      const BUDGET_FLOOR = { shards: 700, state: 1200, anchor: 350, recall: 500, pinned: 350, recent: 450, activity: 250, hints: 300 }
+      const scaledSections = ['shards', 'state', 'anchor', 'recall', 'pinned', 'recent', 'activity', 'hints']
       const otherSum = scaledSections.reduce(function (a, k) { return a + SEC_BUDGET[k] }, 0)
       const targetOther = Math.max(3000, Math.round(maxChars * 0.95) - conventionsMax)
       const budgetScale = Math.min(1, targetOther / otherSum)
@@ -604,6 +611,52 @@ export function apply(ctx, config) {
       SECTIONS.hints.push('  powershell -ExecutionPolicy Bypass -File "' + cliPath + '" recent -Limit 20')
       SECTIONS.hints.push('  powershell -ExecutionPolicy Bypass -File "' + cliPath + '" handoff    # 接力另一台机器的会话')
 
+      // ---- STATE CARD (2026-10-25): recent per-session working state ----
+      try {
+        if (stateDir && existsSync(stateDir)) {
+          const cards = []
+          for (const d of readdirSync(stateDir)) {
+            try {
+              const p = join(stateDir, d, 'state.md')
+              if (existsSync(p)) { const st = statSync(p); cards.push({ d, p, m: st.mtimeMs }) }
+            } catch (e) { }
+          }
+          cards.sort(function (a, b) { return b.m - a.m })
+          const pick = cards.slice(0, Math.max(1, stateCards))
+          if (pick.length) {
+            SECTIONS.state.push('')
+            SECTIONS.state.push('### 会话状态卡（每轮注入；按标题认领你自己的那张）')
+            for (const c of pick) {
+              try {
+                let body = readFileSync(c.p, 'utf8')
+                if (body.charCodeAt(0) === 0xFEFF) body = body.slice(1)
+                body = body.replace(/\r?\n/g, ' ').replace(/\s+/g, ' ').trim()
+                if (body.length > 800) body = body.slice(0, 800) + '…'
+                const tm = body.match(/- title: ([^\-]*?)(?: -|$)/)
+                const title = tm && tm[1] ? tm[1].trim() : c.d.slice(0, 40)
+                const upd = new Date(c.m).toISOString().slice(0, 19) + 'Z'
+                SECTIONS.state.push('- 【' + title + '】 ' + c.d + ' · updated ' + upd)
+                SECTIONS.state.push('  ' + body)
+              } catch (e) { }
+            }
+          }
+        }
+      } catch (e) { }
+      // ---- ANCHOR POINTERS (2026-10-25): exact anchors with session + seq, for mem-read readback ----
+      try {
+        if (anchorPath && existsSync(anchorPath)) {
+          let at = readFileSync(anchorPath, 'utf8')
+          if (at.charCodeAt(0) === 0xFEFF) at = at.slice(1)
+          at = at.trim()
+          if (at.length > anchorMaxChars) at = at.slice(0, anchorMaxChars) + '…'
+          const alines = at.split(/\r?\n/).filter(function (ln) { return ln.indexOf('- ') === 0 })
+          if (alines.length) {
+            SECTIONS.anchor.push('')
+            SECTIONS.anchor.push('### 最近锚点（原文指针 session·seq；用 mem-read 回读原文）')
+            for (const ln of alines) SECTIONS.anchor.push(ln)
+          }
+        }
+      } catch (e) { }
       SECTIONS.pinned.push('')
       SECTIONS.pinned.push('### 定义型记忆（决策/事实/规则/更正，不按新旧筛）')
       try {
@@ -668,7 +721,7 @@ export function apply(ctx, config) {
         return out
       }
       const tail = []
-      for (const name of ['recall', 'conv', 'shards', 'pinned', 'recent', 'activity', 'hints']) {
+      for (const name of ['recall', 'conv', 'shards', 'state', 'anchor', 'pinned', 'recent', 'activity', 'hints']) {
         const arr = assemble(name, SECTIONS[name], name === 'conv')
         if (arr.length) { tail.push(''); tail.push.apply(tail, arr) }
       }
@@ -678,11 +731,11 @@ export function apply(ctx, config) {
       if (text.length > maxChars) {
         const before = text.length
         let dropped = 0
-        for (const secName of ['recent', 'activity', 'pinned', 'shards', 'recall']) {
+        for (const secName of ['recent', 'activity', 'pinned', 'shards', 'state', 'anchor', 'recall']) {
           while (text.length > maxChars && SECTIONS[secName] && SECTIONS[secName].length > 2) {
             SECTIONS[secName].pop(); dropped++
             const rebuild = []
-            for (const nm of ['recall', 'conv', 'shards', 'pinned', 'recent', 'activity', 'hints']) {
+            for (const nm of ['recall', 'conv', 'shards', 'state', 'anchor', 'pinned', 'recent', 'activity', 'hints']) {
               const arr = assemble(nm, SECTIONS[nm], nm === 'conv')
               if (arr.length) { rebuild.push(''); rebuild.push.apply(rebuild, arr) }
             }
@@ -752,6 +805,13 @@ export function apply(ctx, config) {
 
   function saveMemory(kind, title, body, session) {
     try {
+      // 2026-10-25 FIX: 显式配置的 cliPath 若不存在，禁止回退到别的安装路径。
+      //   旧行为: pickExisting() 在"配置了但不存在"时会回退到候选里真实存在的 dsh-mem.ps1，
+      //   结果 verify.mjs 用假路径跑自测时，数据被写进了真实记忆库（已产生 18 条假 llm-call）。
+      if (config.cliPath && !existsSync(String(config.cliPath))) {
+        log('CLI-MISSING ' + String(config.cliPath) + ' — 显式配置的 CLI 不存在，拒绝回退/执行')
+        return
+      }
       const dir = mkdtempSync(join(tmpdir(), 'dshmem-'))
       const tPath = join(dir, 'title.txt')
       const bPath = join(dir, 'body.txt')
@@ -763,7 +823,7 @@ export function apply(ctx, config) {
       const machine = config.machine || process.env.COMPUTERNAME || 'unknown'
       const src = session && session.id ? String(session.id) : ''
       const q = function (s) { return String(s).replace(/'/g, "''") }
-      // ★ 机器名可能是中文（本机 COMPUTERNAME 就是"<HUB>"）。
+      // ★ 机器名可能是中文（例如以中文命名的 Windows 主机）。
       //   v0.4.1 把 -Subject '<机器名>' 内联进这个 wrapper，而 wrapper 是【无 BOM 的
       //   UTF-8 .ps1】—— PowerShell 5.1 会按 ANSI 读它，于是中文被写成乱码
       //   （实测: 库里 subject 存成 "鏈ㄦ槗"，E9 8F 88 …）。
@@ -851,14 +911,14 @@ export function apply(ctx, config) {
         const body = [
           '本地模型调用记录（dsh-memory-bridge 自动记账）',
           '',
-          '模型     : ' + q.model + '  @ 本地 GPU 节点（Ollama）',
+          '模型     : ' + q.model + '  @ <ollama-host>（GPU, Ollama）',
           '会话     : ' + sid,
           '调用次数 : ' + q.count,
           '耗时合计 : ' + (q.ms / 1000).toFixed(1) + ' 秒',
           'tokens   : 输入 ' + q.inTok + ' / 输出 ' + q.outTok,
           '用途     : ' + (q.purposes.size ? Array.from(q.purposes).join(', ') : '(普通对话)'),
           '',
-          '说明: 本地模型跑在本地 GPU 节点上，不消耗云端额度；',
+          '说明: 本地模型跑在局域网 GPU 上，不消耗云端额度；',
           '      空闲时不占显存（keep_alive=0），不影响该机打游戏。'
         ].join('\n')
         const title = '本地模型调用 · ' + q.model + ' × ' + q.count + ' · ' + sid.slice(8, 16)
