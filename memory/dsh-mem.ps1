@@ -1,5 +1,4 @@
-﻿# 第一次用？先看 README 的「5 分钟跑起来」，再回来读这个脚本。
-<#
+﻿<#
   dsh-mem.ps1  -  DSH long-term memory CLI
   Requires PowerShell 7 or Windows PowerShell 5.1 (System.Data.SqlClient + SqlBulkCopy).
 
@@ -35,7 +34,7 @@
     answers.  Anything else => a DEGRADED line is printed and literal search plus
     surrounding turns is used instead.  Silent degradation is forbidden on purpose
     (see shared memory [115]).
-      "embed": { "baseURL": "http://192.0.2.18:11434", "model": "bge-m3", "dim": 1024 }
+      "embed": { "baseURL": "http://10.0.0.18:11434", "model": "bge-m3", "dim": 1024 }
     Use the model host's own IP: 127.0.0.1 would only work on that host itself.
 
   Offline behaviour
@@ -65,6 +64,7 @@ param(
   [int]$Chars = 0,
   [switch]$Reembed,
   [switch]$DryRun,
+  [switch]$AllowMessagePrune,
   [switch]$SelfTest,
   [string]$Tags = '',
   [string]$Scope = 'machine',
@@ -104,35 +104,13 @@ function Read-TextFile([string]$Path) {
 
 $Root    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $CfgPath = Join-Path $Root 'dsh-mem.config.json'
-# 配置查找兜底（开源版：不要求用户把配置放在脚本旁边）
-if (-not (Test-Path -LiteralPath $CfgPath)) {
-    $candidates = @(
-        $env:DSH_MEM_CONFIG,
-        (Join-Path 'C:\dsh-mem' 'dsh-mem.config.json'),
-        (Join-Path $PSScriptRoot '..\dsh-mem.config.json')
-    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
-    if ($candidates) { $CfgPath = @($candidates)[0] }
-}
-if (-not (Test-Path -LiteralPath $CfgPath)) {
-    throw ("config not found: " + $CfgPath + "
-  解决：把 dsh-mem.config.json 放到 C:\dsh-mem\，或用 -Root <目录> 指定，或设环境变量 DSH_MEM_CONFIG")
-}
+if (-not (Test-Path -LiteralPath $CfgPath)) { throw "config not found: $CfgPath" }
 $cfg = Read-TextFile $CfgPath | ConvertFrom-Json
 
-# ================= 数据库后端（sqlserver / mysql）=================
-$script:Provider = if ($cfg.provider) { ([string]$cfg.provider).Trim().ToLower() } else { 'sqlserver' }
-if (@('sqlserver', 'mysql', 'sqlite') -notcontains $script:Provider) {
-  throw ("provider 只支持 sqlserver / mysql / sqlite（当前: " + $script:Provider + "）")
-}
-$script:MySqlCliPath = if ($cfg.mysqlCliPath) { [string]$cfg.mysqlCliPath } else { 'mysql' }
-$script:SqliteCliPath = if ($cfg.sqliteCliPath) { [string]$cfg.sqliteCliPath } else { 'sqlite3' }
-# ★ 只有 sqlite 后端才需要这个默认值；其它后端不该走 Split-Path（变量名写错会让 ALL 配置启动即崩）
-$script:SqliteDb      = if ($cfg.sqliteDb) { [string]$cfg.sqliteDb } elseif ($script:Provider -eq 'sqlite') { Join-Path (Split-Path -Parent $CfgPath) 'dsh-mem.db' } else { $null }
-
-# --- explicit version, so the cluster never has to infer it from a byte count again ------------
+# --- explicit version, so the fleet never has to infer it from a byte count again ------------
 # Lineage: 32174 (prune/handoff) -> 53025 (offline replica) -> 74605 (recall + embed half)
 #          -> 77609 (path b: vectors keyed by content hash) -> 80330 (3 defects fixed)
-#          -> 81395 (duplicate consolidation, cluster audit) -> 1.0.0 (UNIFIED baseline:
+#          -> 81395 (duplicate consolidation, fleet audit) -> 1.0.0 (UNIFIED baseline:
 #             export redaction on handoff/backup/replica + this version report + check 14).
 # Memory [177]/[178] is what happens without this string: two machines compared byte counts,
 # both read a stale number, and the direction of the fix was reported backwards.
@@ -176,8 +154,7 @@ Add-Type -AssemblyName System.Data
 $script:Db          = $cfg.database
 $script:CsBase      = "Server=$($cfg.server);User Id=$($cfg.user);Password=$($cfg.password);TrustServerCertificate=True;Connect Timeout=20"
 $script:StatePath   = Join-Path $Root 'dsh-mem-state.json'
-# 副本路径：配置里写了就用配置的（文档承诺过），否则默认放在脚本旁边
-$script:ReplicaPath = if ($cfg.replicaPath) { [string]$cfg.replicaPath } else { Join-Path (Split-Path -Parent $CfgPath) 'dsh-mem-replica.json' }
+$script:ReplicaPath = Join-Path $Root 'dsh-mem-replica.json'
 $script:ReplicaError = ''
 $script:RedactList  = @()
 if ($cfg.redact) { $script:RedactList = @($cfg.redact) }
@@ -185,383 +162,7 @@ $script:State       = if (Test-Path -LiteralPath $script:StatePath) {
                         try { Read-TextFile $script:StatePath | ConvertFrom-Json } catch { [pscustomobject]@{} }
                       } else { [pscustomobject]@{} }
 
-# ============ MySQL 后端（走 mysql.exe，零额外依赖）============
-function ConvertTo-MySqlLiteral {
-  param($Value)
-  if ($null -eq $Value) { return 'NULL' }
-  if ($Value -is [bool]) { if ($Value) { return '1' } else { return '0' } }
-  if (($Value -is [int]) -or ($Value -is [long]) -or ($Value -is [double]) -or ($Value -is [decimal])) {
-    return $Value.ToString([System.Globalization.CultureInfo]::InvariantCulture)
-  }
-  if ($Value -is [datetime]) { return ("'" + $Value.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss.fff') + "'") }
-  $t = [string]$Value
-  $t = $t.Replace('\', '\\').Replace("'", "''")
-  return ("'" + $t + "'")
-}
-
-function ConvertTo-MySqlSql {
-  param([string]$Sql, [hashtable]$Params)
-  $s = $Sql
-  # ① 参数替换（先替长名字，避免 @n 吃掉 @n2）
-  if ($Params -and $Params.Count -gt 0) {
-    foreach ($k in (@($Params.Keys) | Sort-Object Length -Descending)) {
-      $lit = ConvertTo-MySqlLiteral $Params[$k]
-      $pat = [regex]::Escape([string]$k) + '(?![A-Za-z0-9_])'
-      $s = [regex]::Replace($s, $pat, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $lit })
-    }
-  }
-  # ② MERGE ... machines → INSERT ... ON DUPLICATE KEY UPDATE
-  if ($s -match '(?is)^\s*MERGE\s+(?:dbo\.)?machines') {
-    $m = [regex]::Match($s, '(?is)USING\s*\(\s*SELECT\s+(.+?)\s+AS\s+login_name\s*,\s*(.+?)\s+AS\s+machine(?:\s*,\s*(.+?)\s+AS\s+cli_version)?\s*\)')
-    if ($m.Success) {
-      $login = $m.Groups[1].Value.Trim()
-      $machine = $m.Groups[2].Value.Trim()
-      $ver = if ($m.Groups[3].Success) { $m.Groups[3].Value.Trim() } else { 'NULL' }
-      return ("INSERT INTO machines (login_name, machine, cli_version, first_seen, last_seen) VALUES (" +
-              $login + ", " + $machine + ", " + $ver + ", UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)) " +
-              "ON DUPLICATE KEY UPDATE machine = VALUES(machine), cli_version = VALUES(cli_version), last_seen = VALUES(last_seen)")
-    }
-  }
-  # ③ 方言映射
-  $s = $s -replace '\bdbo\.', ''
-  $s = [regex]::Replace($s, '(?i)\bISNULL\s*\(', 'IFNULL(')
-  $s = [regex]::Replace($s, '(?i)\bSYSUTCDATETIME\s*\(\s*\)', 'UTC_TIMESTAMP(3)')
-  $s = [regex]::Replace($s, '(?i)\bGETUTCDATE\s*\(\s*\)', 'UTC_TIMESTAMP(3)')
-  $s = [regex]::Replace($s, '(?i)\bLEN\s*\(', 'CHAR_LENGTH(')
-  $s = [regex]::Replace($s, '(?i)\bDATALENGTH\s*\(', 'OCTET_LENGTH(')
-  $s = [regex]::Replace($s, '(?i)\bSUSER_SNAME\s*\(\s*\)', (ConvertTo-MySqlLiteral $script:MyLoginName))
-  $s = [regex]::Replace($s, '(?i)\bHOST_NAME\s*\(\s*\)', (ConvertTo-MySqlLiteral $env:COMPUTERNAME))
-  # CONVERT(varchar(33), X, 126) → DATE_FORMAT(X,'%Y-%m-%dT%H:%i:%s')
-  $s = [regex]::Replace($s, '(?is)CONVERT\s*\(\s*varchar\s*\(\s*\d+\s*\)\s*,\s*(.+?)\s*,\s*126\s*\)', "DATE_FORMAT(`$1, '%Y-%m-%dT%H:%i:%s')")
-  # ★ MySQL 的 + 是数值加法：'2026-10-23T…' + 'Z' 会变成 2026（不是拼接！）。
-  #   所以 SQL Server 的 CONVERT(...)+'Z' 必须包成 CONCAT(...)。这个坑实测踩过。
-  $s = [regex]::Replace($s, "(?is)(DATE_FORMAT\s*\([^()]*\))\s*\+\s*'Z'", "CONCAT(`$1, 'Z')")
-  # N'...' → '...'
-  $s = [regex]::Replace($s, '(?i)\bLEFT\s*\(\s*([^,]+?)\s*,\s*(\d+)\s*\)', 'substr($1, 1, $2)')
-  $s = [regex]::Replace($s, '(?i)\bRIGHT\s*\(\s*([^,]+?)\s*,\s*(\d+)\s*\)', 'substr($1, -($2))')
-  $s = [regex]::Replace($s, '(?i)\bCHARINDEX\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)', 'instr($2, $1)')
-  $s = [regex]::Replace($s, "(?i)\bN'", "'")
-  # TOP (n) → LIMIT n（挪到语句末尾）
-  # TOP 有两种写法：TOP (n) 和 TOP n —— 两种都要处理（engine 里都有）
-  $mt = [regex]::Match($s, '(?is)\bTOP\s*\(\s*([^)]+?)\s*\)')
-  if (-not $mt.Success) { $mt = [regex]::Match($s, '(?is)\bTOP\s+(\d+)\b') }
-  if ($mt.Success) {
-    $lim = $mt.Groups[1].Value.Trim()
-    $s = [regex]::Replace($s, '(?is)\bSELECT\s+TOP\s*(?:\(\s*[^)]+?\s*\)|\d+)\s+', 'SELECT ')
-    $s = $s.TrimEnd().TrimEnd(';') + ' LIMIT ' + $lim
-  }
-  return $s
-}
-
-function ConvertFrom-MySqlEscaped {
-  param([string]$Text)
-  if ($Text -eq '\N') { return $null }          # batch 模式的 NULL
-  return [regex]::Replace($Text, '\\(.)', {
-        param($m)
-        $c = $m.Groups[1].Value
-        switch ($c) {
-            't' { "`t" }
-            'n' { "`n" }
-            'r' { "`r" }
-            '0' { [string][char]0 }
-            '\\' { '\' }
-            "'" { "'" }
-            default { $c }
-        }
-    })
-}
-
-function Invoke-MySqlCli {
-  param([string]$Sql, [string]$Db)
-  if (-not $Db) { $Db = $script:Db }
-  # SET time_zone='+00:00' —— 用 [char]39 拼，避免多层引号嵌套
-  $tzInit = '--init-command=SET time_zone=' + [char]39 + '+00:00' + [char]39
-  $cnf = [System.IO.Path]::GetTempFileName()
-  try {
-    $lines = @('[client]',
-               ('user=' + [string]$cfg.user),
-               ('password=' + [string]$cfg.password),
-               ('host=' + ([string]$cfg.server).Split(',')[0]),
-               'port=3306',
-               'connect-timeout=20')
-    if (([string]$cfg.server) -match ',\s*(\d+)\s*$') { $lines[4] = 'port=' + $matches[1] }
-    [System.IO.File]::WriteAllText($cnf, ($lines -join "`r`n"), (New-Object System.Text.ASCIIEncoding))
-    $argList = @(
-      ('--defaults-extra-file=' + $cnf),
-      '--batch', '--default-character-set=utf8mb4',
-      $tzInit,
-      '-e', $Sql, $Db
-    )
-    $out = & $script:MySqlCliPath @argList 2>&1
-    $code = $LASTEXITCODE
-    if ($code -ne 0) {
-      $msg = (@($out) | Where-Object { $_ -and ($_ -notmatch 'Using a password on the command line') }) -join ' | '
-      throw ('mysql error ' + $code + ': ' + $msg)
-    }
-    return @($out)
-  } finally { Remove-Item -LiteralPath $cnf -Force -ErrorAction SilentlyContinue }
-}
-
-function Invoke-MySqlScript {
-  # 大脚本走 stdin（命令行有长度上限，sync 一次可能几 MB）
-  param([string]$Sql, [string]$Db)
-  if (-not $Db) { $Db = $script:Db }
-  # 经 cmd.exe 传递时必须整体加双引号，否则空格会把参数切成两半（实测：mysql 直接打印 usage）
-  $tzInit = '--init-command=' + [char]34 + 'SET time_zone=' + [char]39 + '+00:00' + [char]39 + [char]34
-  $cnf = [System.IO.Path]::GetTempFileName()
-  $sqlf = [System.IO.Path]::GetTempFileName()
-  try {
-    $lines = @('[client]',
-               ('user=' + [string]$cfg.user),
-               ('password=' + [string]$cfg.password),
-               ('host=' + ([string]$cfg.server).Split(',')[0]),
-               'port=3306',
-               'connect-timeout=20')
-    if (([string]$cfg.server) -match ',\s*(\d+)\s*$') { $lines[4] = 'port=' + $matches[1] }
-    [System.IO.File]::WriteAllText($cnf, ($lines -join "`r`n"), (New-Object System.Text.ASCIIEncoding))
-    [System.IO.File]::WriteAllText($sqlf, $Sql, (New-Object System.Text.UTF8Encoding $false))
-    $argLine = ('--defaults-extra-file="' + $cnf + '" --batch --default-character-set=utf8mb4 ' +
-                $tzInit + ' ' + $Db + ' < "' + $sqlf + '"')
-    $out = & cmd.exe /c ('"' + $script:MySqlCliPath + '" ' + $argLine + ' 2>&1')
-    if ($LASTEXITCODE -ne 0) {
-      $msg = (@($out) | Where-Object { $_ -and ($_ -notmatch 'Using a password') }) -join ' | '
-      throw ('mysql script error ' + $LASTEXITCODE + ': ' + $msg)
-    }
-    return @($out)
-  } finally {
-    Remove-Item -LiteralPath $cnf, $sqlf -Force -ErrorAction SilentlyContinue
-  }
-}
-
-function ConvertTo-MySqlRows {
-  param([string[]]$RawLines)
-  $lines = @($RawLines | Where-Object { $_ -ne $null })
-  if ($lines.Count -eq 0) { return @() }
-  $header = $lines[0] -split "`t"
-  $rows = New-Object System.Collections.ArrayList
-  for ($i = 1; $i -lt $lines.Count; $i++) {
-    $cells = $lines[$i] -split "`t"
-    $h = [ordered]@{}
-    for ($c = 0; $c -lt $header.Count; $c++) {
-      $raw = if ($c -lt $cells.Count) { $cells[$c] } else { '' }
-      $v = ConvertFrom-MySqlEscaped $raw
-      if ($v -is [string] -and $v -match '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$') {
-        $dv = [datetime]::MinValue
-                                if (-not [datetime]::TryParseExact($v, [string[]]@('yyyy-MM-dd HH:mm:ss.fff','yyyy-MM-dd HH:mm:ss'), [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$dv)) { $dv = [datetime]::ParseExact(($v -replace '(\.\d+)$', ''), 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture) }
-                                $v = [datetime]::SpecifyKind($dv, [System.DateTimeKind]::Utc)
-      }
-      $h[$header[$c]] = $v
-    }
-    [void]$rows.Add([pscustomobject]$h)
-  }
-  return $rows.ToArray()
-}
-
-function New-MySqlShim {
-  param([string]$Db)
-  $shim = [pscustomobject]@{ Database = $Db; Open_ = $false }
-  $shim | Add-Member -MemberType ScriptMethod -Name Open -Value { $this.Open_ = $true }
-  $shim | Add-Member -MemberType ScriptMethod -Name Close -Value { $this.Open_ = $false }
-  $shim | Add-Member -MemberType ScriptMethod -Name CreateCommand -Value {
-    $cmd = [pscustomobject]@{ CommandText = ''; CommandTimeout = 120; Params = @{} }
-    $cmd | Add-Member -MemberType ScriptMethod -Name ExecuteNonQuery -Value {
-      $sql = ConvertTo-MySqlSql -Sql $this.CommandText -Params $this.Params
-      $null = Invoke-MySqlCli -Sql $sql
-      return 1
-    }
-    $cmd | Add-Member -MemberType ScriptMethod -Name ExecuteReader -Value {
-      $sql = ConvertTo-MySqlSql -Sql $this.CommandText -Params $this.Params
-      $raw = Invoke-MySqlCli -Sql $sql
-      $rows = ConvertTo-MySqlRows -RawLines $raw
-      $names = @()
-      if (@($rows).Count -gt 0) { $names = @($rows[0].PSObject.Properties.Name) }
-      else {
-        $ls = @($raw | Where-Object { $_ -ne $null })
-        if ($ls.Count -ge 1) { $names = @($ls[0] -split "`t") }
-      }
-      $rd = [pscustomobject]@{ Rows = @($rows); Names = $names; Index = -1 }
-      $rd | Add-Member -MemberType ScriptMethod -Name Read -Value { $this.Index++; return ($this.Index -lt @($this.Rows).Count) }
-      # FieldCount 必须是**属性**：Invoke-Rows 用 $rd.FieldCount 取值，
-      # 写成 get_FieldCount() 方法在 PSObject 上不会被当成属性读，结果永远是 $null（实测踩过）
-      $rd | Add-Member -MemberType NoteProperty -Name FieldCount -Value (@($names).Count) -Force
-      $rd | Add-Member -MemberType ScriptMethod -Name GetName -Value { param($i) return [string]@($this.Names)[$i] }
-      $rd | Add-Member -MemberType ScriptMethod -Name GetValue -Value { param($i) $n = [string]@($this.Names)[$i]; return $this.Rows[$this.Index].$n }
-      $rd | Add-Member -MemberType ScriptMethod -Name Close -Value { }
-      return $rd
-    }
-    $paramsObj = [pscustomobject]@{}
-    $paramsObj | Add-Member -MemberType ScriptMethod -Name AddWithValue -Value {
-      param($name, $value)
-      $this.Owner.Params[[string]$name] = $value
-      return $null
-    }
-    $paramsObj | Add-Member -NotePropertyName Owner -NotePropertyValue $cmd
-    $cmd | Add-Member -MemberType NoteProperty -Name Parameters -Value $paramsObj
-    return $cmd
-  }
-  return $shim
-}
-
-
-# ============================================================================
-#  SQLite 后端（v0.3.0）——与 mysql 一样走外部 CLI（sqlite3.exe），零 DLL 依赖
-# ============================================================================
-function ConvertTo-SqliteLiteral {
-  param($Value)
-  if ($null -eq $Value) { return 'NULL' }
-  if ($Value -is [bool]) { if ($Value) { return '1' } else { return '0' } }
-  if (($Value -is [int]) -or ($Value -is [long]) -or ($Value -is [double]) -or ($Value -is [decimal])) {
-    return $Value.ToString([System.Globalization.CultureInfo]::InvariantCulture)
-  }
-  if ($Value -is [datetime]) { return ("'" + $Value.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fff") + "Z'") }
-  $t = [string]$Value
-  $t = $t.Replace("'", "''")
-  return ("'" + $t + "'")
-}
-
-function Get-SqliteNow { return "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))" }
-
-function ConvertTo-SqliteSql {
-  param([string]$Sql, [hashtable]$Params)
-  $s = $Sql
-  if ($Params -and $Params.Count -gt 0) {
-    foreach ($k in (@($Params.Keys) | Sort-Object Length -Descending)) {
-      $lit = ConvertTo-SqliteLiteral $Params[$k]
-      $pat = [regex]::Escape([string]$k) + '(?![A-Za-z0-9_])'
-      $s = [regex]::Replace($s, $pat, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $lit })
-    }
-  }
-  $now = Get-SqliteNow
-  if ($s -match '(?is)^\s*MERGE\s+(?:dbo\.)?machines') {
-    $m = [regex]::Match($s, '(?is)USING\s*\(\s*SELECT\s+(.+?)\s+AS\s+login_name\s*,\s*(.+?)\s+AS\s+machine(?:\s*,\s*(.+?)\s+AS\s+cli_version)?\s*\)')
-    if ($m.Success) {
-      $login = $m.Groups[1].Value.Trim()
-      $machine = $m.Groups[2].Value.Trim()
-      $ver = if ($m.Groups[3].Success) { $m.Groups[3].Value.Trim() } else { 'NULL' }
-      return ("INSERT INTO machines (login_name, machine, cli_version, first_seen, last_seen) VALUES (" + $login + ", " + $machine + ", " + $ver + ", " + $now + ", " + $now + ") ON CONFLICT(login_name) DO UPDATE SET machine = excluded.machine, cli_version = excluded.cli_version, last_seen = excluded.last_seen")
-    }
-  }
-  $s = $s -replace '\bdbo\.', ''
-  $s = [regex]::Replace($s, '(?i)\bISNULL\s*\(', 'IFNULL(')
-  $s = [regex]::Replace($s, '(?i)\bSYSUTCDATETIME\s*\(\s*\)', $now)
-  $s = [regex]::Replace($s, '(?i)\bGETUTCDATE\s*\(\s*\)', $now)
-  $s = [regex]::Replace($s, '(?i)\bLEN\s*\(', 'length(')
-  $s = [regex]::Replace($s, '(?i)\bDATALENGTH\s*\(', 'length(')
-  $login = if ($script:MyLoginName) { [string]$script:MyLoginName } else { [string]$env:USERNAME }
-  $s = [regex]::Replace($s, '(?i)\bSUSER_SNAME\s*\(\s*\)', [System.Text.RegularExpressions.MatchEvaluator]{ param($m) (ConvertTo-SqliteLiteral $login) })
-  $s = [regex]::Replace($s, '(?i)\bHOST_NAME\s*\(\s*\)', [System.Text.RegularExpressions.MatchEvaluator]{ param($m) (ConvertTo-SqliteLiteral $env:COMPUTERNAME) })
-  $s = [regex]::Replace($s, "(?is)CONVERT\s*\(\s*varchar\s*\(\s*\d+\s*\)\s*,\s*(.+?)\s*,\s*126\s*\)\s*\+\s*'Z'", "strftime('%Y-%m-%dT%H:%M:%fZ', `$1)")
-  $s = [regex]::Replace($s, '(?is)CONVERT\s*\(\s*varchar\s*\(\s*\d+\s*\)\s*,\s*(.+?)\s*,\s*126\s*\)', "strftime('%Y-%m-%dT%H:%M:%fZ', `$1)")
-  $s = [regex]::Replace($s, '(?is)DATEADD\s*\(\s*day\s*,\s*(-?\d+)\s*,\s*([^()]+?)\s*\)', "strftime('%Y-%m-%dT%H:%M:%fZ', `$2, '`$1 day')")
-  $s = [regex]::Replace($s, '(?i)\bLEFT\s*\(\s*([^,]+?)\s*,\s*(\d+)\s*\)', 'substr($1, 1, $2)')
-  $s = [regex]::Replace($s, '(?i)\bRIGHT\s*\(\s*([^,]+?)\s*,\s*(\d+)\s*\)', 'substr($1, -($2))')
-  $s = [regex]::Replace($s, "(?i)\bN'", "'")
-  $mt = [regex]::Match($s, '(?is)\bTOP\s*\(\s*([^)]+?)\s*\)')
-  if (-not $mt.Success) { $mt = [regex]::Match($s, '(?is)\bTOP\s+(\d+)\b') }
-  if ($mt.Success) {
-    $lim = $mt.Groups[1].Value.Trim()
-    $s = [regex]::Replace($s, '(?is)\bSELECT\s+TOP\s*(?:\(\s*[^)]+?\s*\)|\d+)\s+', 'SELECT ')
-    $s = $s.TrimEnd().TrimEnd(';') + ' LIMIT ' + $lim
-  }
-  return $s
-}
-
-function Invoke-SqliteCli {
-  param([string]$Sql)
-  $f = [System.IO.Path]::GetTempFileName() + '.sql'
-  try {
-    [System.IO.File]::WriteAllText($f, $Sql, (New-Object System.Text.UTF8Encoding $false))
-    $out = & cmd.exe /c ('"' + $script:SqliteCliPath + '" -bail -batch "' + $script:SqliteDb + '" < "' + $f + '" 2>&1')
-    if ($LASTEXITCODE -ne 0) {
-      $msg = (@($out) | Where-Object { $_ }) -join ' | '
-      throw ('sqlite error ' + $LASTEXITCODE + ': ' + $msg)
-    }
-    return @($out)
-  } finally { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
-}
-
-function ConvertTo-SqliteRows {
-  param([string[]]$RawLines)
-  $txt = ((@($RawLines) | Where-Object { $_ -ne $null }) -join "`n").Trim()
-  if (-not $txt) { return @() }
-  $start = $txt.LastIndexOf('[')
-  if ($start -lt 0) { return @() }
-  try { $arr = $txt.Substring($start) | ConvertFrom-Json } catch { return @() }
-  if ($null -eq $arr) { return @() }
-  # SQLite 把时间存成 TEXT（ISO8601 UTC）；这里统一转回 DateTime，下游才能 .ToLocalTime()
-  $out = @()
-  foreach ($o in @($arr)) {
-    $h = [ordered]@{}
-    foreach ($p in $o.PSObject.Properties) {
-      $v = $p.Value
-      if ($v -is [string] -and $v -match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z?$') {
-        $dt = [datetime]::MinValue
-        $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
-        if ([datetime]::TryParse(($v.TrimEnd('Z')), [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$dt)) { $v = $dt }
-      }
-      $h[$p.Name] = $v
-    }
-    $out += [pscustomobject]$h
-  }
-  return $out
-}
-
-function New-SqliteShim {
-  param([string]$Db)
-  $shim = [pscustomobject]@{ Database = $Db; Open_ = $false }
-  $shim | Add-Member -MemberType ScriptMethod -Name Open -Value { $this.Open_ = $true }
-  $shim | Add-Member -MemberType ScriptMethod -Name Close -Value { $this.Open_ = $false }
-  $shim | Add-Member -MemberType ScriptMethod -Name CreateCommand -Value {
-    $cmd = [pscustomobject]@{ CommandText = ''; CommandTimeout = 120; Params = @{} }
-    $cmd | Add-Member -MemberType ScriptMethod -Name ExecuteNonQuery -Value {
-      $sql = ConvertTo-SqliteSql -Sql $this.CommandText -Params $this.Params
-      $null = Invoke-SqliteCli -Sql $sql
-      return 1
-    }
-    $cmd | Add-Member -MemberType ScriptMethod -Name ExecuteReader -Value {
-      $sql = ConvertTo-SqliteSql -Sql $this.CommandText -Params $this.Params
-      $f = [System.IO.Path]::GetTempFileName() + '.sql'
-      $rows = @()
-      try {
-        [System.IO.File]::WriteAllText($f, $sql, (New-Object System.Text.UTF8Encoding $false))
-        $out = & cmd.exe /c ('"' + $script:SqliteCliPath + '" -bail -json "' + $script:SqliteDb + '" < "' + $f + '" 2>&1')
-        if ($LASTEXITCODE -ne 0) { $msg = (@($out) | Where-Object { $_ }) -join ' | '; throw ('sqlite error ' + $LASTEXITCODE + ': ' + $msg) }
-        $rows = ConvertTo-SqliteRows -RawLines @($out)
-      } finally { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
-      $names = @()
-      if (@($rows).Count -gt 0) { $names = @($rows[0].PSObject.Properties.Name) }
-      $rd = [pscustomobject]@{ Rows = @($rows); Names = $names; Index = -1 }
-      $rd | Add-Member -MemberType ScriptMethod -Name Read -Value { $this.Index++; return ($this.Index -lt @($this.Rows).Count) }
-      $rd | Add-Member -MemberType NoteProperty -Name FieldCount -Value (@($names).Count) -Force
-      $rd | Add-Member -MemberType ScriptMethod -Name GetName -Value { param($i) return [string]@($this.Names)[$i] }
-      $rd | Add-Member -MemberType ScriptMethod -Name GetValue -Value { param($i) $n = [string]@($this.Names)[$i]; return $this.Rows[$this.Index].$n }
-      $rd | Add-Member -MemberType ScriptMethod -Name Close -Value { }
-      return $rd
-    }
-    $paramsObj = [pscustomobject]@{}
-    $paramsObj | Add-Member -MemberType ScriptMethod -Name AddWithValue -Value {
-      param($name, $value)
-      $this.Owner.Params[[string]$name] = $value
-      return $null
-    }
-    $paramsObj | Add-Member -NotePropertyName Owner -NotePropertyValue $cmd
-    $cmd | Add-Member -MemberType NoteProperty -Name Parameters -Value $paramsObj
-    return $cmd
-  }
-  return $shim
-}
-
 function New-Cn([string]$db) {
-  if ($script:Provider -eq 'sqlite') {
-    $shim = New-SqliteShim -Db $script:SqliteDb
-    $shim.Open()
-    return $shim
-  }
-  if ($script:Provider -eq 'mysql') {
-    $shim = New-MySqlShim -Db $db
-    $shim.Open()
-    return $shim
-  }
   $cn = New-Object System.Data.SqlClient.SqlConnection ("Server=$($cfg.server);Database=$db;User Id=$($cfg.user);Password=$($cfg.password);TrustServerCertificate=True;Connect Timeout=20")
   $cn.Open()
   return $cn
@@ -569,31 +170,6 @@ function New-Cn([string]$db) {
 
 function Test-DbAlive {
   try {
-    if ($script:Provider -eq 'sqlite') {
-      if (-not (Test-Path -LiteralPath $script:SqliteDb)) { return $false }
-      $null = Invoke-SqliteCli -Sql 'SELECT 1;'
-      return $true
-    }
-    if ($script:Provider -eq 'mysql') {
-      $null = Invoke-MySqlCli -Sql 'SELECT 1' -Db $script:Db
-      # 版本自查（每进程一次）：DATETIME(3) 需要 5.6.4+，低于此版本会静默丢毫秒
-      if (-not $script:MySqlVersionChecked) {
-        $script:MySqlVersionChecked = $true
-        try {
-          $vOut = @(Invoke-MySqlCli -Sql 'SELECT VERSION()' -Db $script:Db | Where-Object { $_ -and $_ -notmatch 'VERSION' })
-          if ($vOut.Count -gt 0) {
-            $raw = [string]$vOut[-1]
-            if ($raw -match '(\d+)\.(\d+)\.(\d+)') {
-              $ver = [version]($matches[1] + '.' + $matches[2] + '.' + $matches[3])
-              if ($ver -lt [version]'5.6.4') {
-                Write-Host ("  WARN: MySQL " + $raw + " is older than 5.6.4 -- DATETIME(3) is not supported (timestamps lose milliseconds)")
-              }
-            }
-          }
-        } catch { }
-      }
-      return $true
-    }
     $cn = New-Object System.Data.SqlClient.SqlConnection ("Server=$($cfg.server);Database=$($script:Db);User Id=$($cfg.user);Password=$($cfg.password);TrustServerCertificate=True;Connect Timeout=3")
     $cn.Open(); $cn.Close(); return $true
   } catch { return $false }
@@ -653,42 +229,6 @@ function Register-Host {
   # SQL Server itself, so a machine cannot claim to be another one.
   # cli_version is what makes "unified version" checkable from the database host instead of by
   # comparing byte counts (memory [177]/[178] got that wrong twice in one hour).
-  if ($script:Provider -eq 'sqlite') {
-    # SQLite：显式分支。SQL 用**单行拼接**而不是 here-string ——
-    # here-string 的终止符必须顶格，缩进写会让它吞掉后面的代码（实测踩过：静默 0 行）。
-    $login = if ($env:USERNAME) { $env:USERNAME } else { 'local' }
-    $nowSql = "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
-    try {
-      $sqlReg = "INSERT INTO machines (login_name, machine, cli_version, first_seen, last_seen) VALUES (@l, @m, @v, " + $nowSql + ", " + $nowSql + ") ON CONFLICT(login_name) DO UPDATE SET machine = excluded.machine, cli_version = excluded.cli_version, last_seen = excluded.last_seen"
-      [void](Invoke-Exec -Sql $sqlReg -Params @{ '@l' = $login; '@m' = $env:COMPUTERNAME; '@v' = $script:CliVersion })
-    } catch {
-      try {
-        $sqlReg2 = "INSERT INTO machines (login_name, machine, first_seen, last_seen) VALUES (@l, @m, " + $nowSql + ", " + $nowSql + ") ON CONFLICT(login_name) DO UPDATE SET machine = excluded.machine, last_seen = excluded.last_seen"
-        [void](Invoke-Exec -Sql $sqlReg2 -Params @{ '@l' = $login; '@m' = $env:COMPUTERNAME })
-      } catch { }
-    }
-    return
-  }
-  if ($script:Provider -eq 'mysql') {
-    # MySQL 没有 MERGE：用 INSERT ... ON DUPLICATE KEY UPDATE。
-    # 身份取"实际的数据库账号 + 本机名"，这两项由连接本身决定，不是调用方随便写的字符串。
-    try {
-      [void](Invoke-Exec -Sql @"
-INSERT INTO machines (login_name, machine, cli_version, first_seen, last_seen)
-VALUES (CURRENT_USER(), @m, @v, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))
-ON DUPLICATE KEY UPDATE machine = VALUES(machine), cli_version = VALUES(cli_version), last_seen = VALUES(last_seen)
-"@ -Params @{ '@m' = $env:COMPUTERNAME; '@v' = $script:CliVersion })
-    } catch {
-      try {
-        [void](Invoke-Exec -Sql @"
-INSERT INTO machines (login_name, machine, first_seen, last_seen)
-VALUES (CURRENT_USER(), @m, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))
-ON DUPLICATE KEY UPDATE machine = VALUES(machine), last_seen = VALUES(last_seen)
-"@ -Params @{ '@m' = $env:COMPUTERNAME })
-      } catch { }
-    }
-    return
-  }
   try {
     [void](Invoke-Exec -Sql @"
 MERGE dbo.machines AS t
@@ -760,22 +300,13 @@ $script:ColLimits = [ordered]@{
   source_session = 64
 }
 
-function Get-CodePointLength([string]$text) {
-    # DB 侧 CHAR_LENGTH()/length() 按码点计数；.NET 的 .Length 按 UTF-16 码元（代理对算 2）。
-    # 用码点数与之对齐，否则含 emoji 的标题/正文会被误报"长度不一致"。
-    if (-not $text) { return 0 }
-    $n = 0
-    foreach ($ch in $text.ToCharArray()) { if (-not [char]::IsLowSurrogate($ch)) { $n++ } }
-    return $n
-}
-
 function Assert-Length([string]$field, [string]$value, [int]$limit) {
   # Normalise JSON-escaped quotes/newlines and SQL placeholders: they survive redaction and
   # used to be counted as secrets (rules R31).
-  $t = $value -replace '\\u0027|\\u0022|\\n|\\r|\\t', ' '
+  $t = $t -replace '\\u0027|\\u0022|\\n|\\r|\\t', ' '
   $t = $t -replace '<PW>|<pw>|<password>|<secret>', ' '
   $n = 0
-  if ($t) { $n = Get-CodePointLength $t }
+  if ($value) { $n = $value.Length }
   if ($n -gt $limit) {
     # Never echo the value: the raw SQL error quoted the truncated title, which is exactly how a
     # fragment escapes into a terminal or a log file (same pattern as rule R6).
@@ -851,7 +382,7 @@ function Invoke-Sync {
       'tool/call' {
         if ($IncludeTools) {
           $arg = [string]$e.data.arguments
-          if ($arg.Length -gt 8000) { $arg = $arg.Substring(0, 8000) + '...[truncated at 8000 chars]' }
+          if ($arg.Length -gt 32000) { $arg = $arg.Substring(0, 32000) + '...[truncated at 32000 chars]' }
           $t = ('[' + $e.data.name + '] ' + $arg)
           $r = $dt.NewRow(); $r.session_id = $sid; $r.seq = [int64]$e.seq; $r.turn = [int]$e.data.turn; $r.role = 'tool_call'; $r.text = $t; $r.created_at = $ts; [void]$dt.Rows.Add($r); $nTool++
         }
@@ -898,119 +429,6 @@ function Invoke-Sync {
   if ($SkipArchive) {
     Write-Host "  WARNING: -SkipArchive is set -- rows the log no longer has will be deleted WITHOUT a copy" -ForegroundColor Yellow
   }
-  if ($script:Provider -eq 'mysql') {
-    # MySQL 没有 SqlBulkCopy / 临时表跨连接不存在 ⇒ 整个写作阶段放进**一次** mysql.exe 调用：
-    # 建临时表 → 灌数据 → 归档 → 更新 → 插入 → 删除 → 回报计数。
-    # 只追加触发器允许维护模式：脚本开头 SET @dsh_allow_mutation = 1（见 sql/mysql/007）。
-    $by = [string]$env:COMPUTERNAME
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.AppendLine('SET @dsh_allow_mutation = 1;')
-    [void]$sb.AppendLine('DROP TEMPORARY TABLE IF EXISTS _dsh_incoming;')
-    [void]$sb.AppendLine('CREATE TEMPORARY TABLE _dsh_incoming (seq BIGINT NOT NULL, turn INT NULL, role VARCHAR(24) NOT NULL, text LONGTEXT NULL, created_at DATETIME(3) NOT NULL, KEY (seq)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;')
-    $batch = New-Object System.Collections.Generic.List[string]
-    foreach ($row in $dt.Rows) {
-      $seqLit = [string][int64]$row.seq
-      $turnLit = 'NULL'
-      if ($null -ne $row.turn -and [string]$row.turn -ne '') { $turnLit = [string][int]$row.turn }
-      $batch.Add('(' + $seqLit + ',' + $turnLit + ',' + (ConvertTo-MySqlLiteral ([string]$row.role)) + ',' +
-                 (ConvertTo-MySqlLiteral ([string]$row.text)) + ',' + (ConvertTo-MySqlLiteral ([datetime]$row.created_at)) + ')')
-      if ($batch.Count -ge 100) {
-        [void]$sb.AppendLine('INSERT INTO _dsh_incoming VALUES ' + ($batch -join ',') + ';')
-        $batch.Clear()
-      }
-    }
-    if ($batch.Count -gt 0) { [void]$sb.AppendLine('INSERT INTO _dsh_incoming VALUES ' + ($batch -join ',') + ';') }
-    [void]$sb.AppendLine('SET @sid = ' + (ConvertTo-MySqlLiteral $sid) + ';')
-    [void]$sb.AppendLine('SET @by = ' + (ConvertTo-MySqlLiteral $by) + ';')
-    [void]$sb.AppendLine(@"
-SET @dropped = (SELECT COUNT(*) FROM messages m LEFT JOIN _dsh_incoming i ON i.seq = m.seq WHERE m.session_id = @sid AND i.seq IS NULL);
-SET @changed = (SELECT COUNT(*) FROM messages m JOIN _dsh_incoming i ON i.seq = m.seq
-   WHERE m.session_id = @sid AND (MD5(IFNULL(m.text,'')) <> MD5(IFNULL(i.text,'')) OR IFNULL(m.role,'') <> IFNULL(i.role,'') OR IFNULL(m.turn,-1) <> IFNULL(i.turn,-1)));
-INSERT INTO messages_history (id, session_id, seq, turn, role, text, created_at, archive_reason, archived_by)
-SELECT m.id, m.session_id, m.seq, m.turn, m.role, m.text, m.created_at,
-       CASE WHEN i.seq IS NULL THEN 'dropped' ELSE 'changed' END, @by
-FROM messages m LEFT JOIN _dsh_incoming i ON i.seq = m.seq
-WHERE m.session_id = @sid
-  AND (i.seq IS NULL OR MD5(IFNULL(m.text,'')) <> MD5(IFNULL(i.text,'')) OR IFNULL(m.role,'') <> IFNULL(i.role,'') OR IFNULL(m.turn,-1) <> IFNULL(i.turn,-1));
-UPDATE messages m JOIN _dsh_incoming i ON i.seq = m.seq
-   SET m.turn = i.turn, m.role = i.role, m.text = i.text, m.created_at = i.created_at
-WHERE m.session_id = @sid
-  AND (MD5(IFNULL(m.text,'')) <> MD5(IFNULL(i.text,'')) OR IFNULL(m.role,'') <> IFNULL(i.role,'') OR IFNULL(m.turn,-1) <> IFNULL(i.turn,-1));
-SET @upd = ROW_COUNT();
-INSERT INTO messages (session_id, seq, turn, role, text, created_at)
-SELECT @sid, i.seq, i.turn, i.role, i.text, i.created_at FROM _dsh_incoming i
-WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.session_id = @sid AND m.seq = i.seq);
-SET @ins = ROW_COUNT();
-DELETE m FROM messages m WHERE m.session_id = @sid AND NOT EXISTS (SELECT 1 FROM _dsh_incoming i WHERE i.seq = m.seq);
-SET @del = ROW_COUNT();
-SELECT @dropped AS dropped, @changed AS changed, @ins AS inserted, @upd AS updated, @del AS removed;
-"@)
-    try {
-      $outW = Invoke-MySqlScript -Sql ($sb.ToString()) -Db $script:Db
-      $lineNums = @($outW | Where-Object { $_ -match '^\d' } | Select-Object -Last 1)
-      if ($lineNums.Count -gt 0) {
-        $p = ([string]$lineNums[0]) -split "`t"
-        $archDropped = [int]$p[0]; $archChanged = [int]$p[1]
-        $updIns = [int]$p[2]; $updUpd = [int]$p[3]; $updRem = [int]$p[4]
-      }
-    } catch {
-      throw ("phase 1+2 write failed, refusing to touch this session's rows: " + $_.Exception.Message)
-    }
-    # sessions 表用 MySQL 的 upsert
-    [void](Invoke-Exec -Sql @"
-INSERT INTO sessions (session_id, machine, cwd, title, event_count, started_at, last_seen_at)
-VALUES (@sid, @machine, @cwd, @title, @cnt, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))
-ON DUPLICATE KEY UPDATE machine = VALUES(machine), cwd = VALUES(cwd), title = VALUES(title),
-                        event_count = VALUES(event_count), last_seen_at = VALUES(last_seen_at)
-"@ -Params @{ '@sid' = $sid; '@machine' = [string]$env:COMPUTERNAME; '@cwd' = $cwd; '@title' = $sessTitle; '@cnt' = $events.Count })
-  } elseif ($script:Provider -eq 'sqlite') {
-    # SQLite 没有 SqlBulkCopy；但一次 CLI 调用就是一个连接，所以临时表能用。
-    # 整个写作阶段放进一次调用：临时表 → 归档 → upsert → 删除 → 计数。
-    # 只追加触发器靠 _guard_state.allow_mutation 放行，脚本末尾同一调用里复位。
-    $by      = [string]$env:COMPUTERNAME
-    $sidLit  = ConvertTo-SqliteLiteral $sid
-    $byLit   = ConvertTo-SqliteLiteral $by
-    $cmpOld  = "IFNULL(m.text,'') <> IFNULL(i.text,'') OR IFNULL(m.role,'') <> IFNULL(i.role,'') OR IFNULL(m.turn,-1) <> IFNULL(i.turn,-1)"
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.AppendLine('BEGIN;')
-    [void]$sb.AppendLine('CREATE TEMP TABLE _incoming (seq INTEGER NOT NULL, turn INTEGER, role TEXT NOT NULL, text TEXT, created_at TEXT NOT NULL);')
-    $batch = New-Object System.Collections.Generic.List[string]
-    foreach ($row in $dt.Rows) {
-      $turnLit = 'NULL'
-      if ($null -ne $row.turn -and [string]$row.turn -ne '') { $turnLit = [string][int]$row.turn }
-      $batch.Add('(' + [string][int64]$row.seq + ',' + $turnLit + ',' + (ConvertTo-SqliteLiteral ([string]$row.role)) + ',' + (ConvertTo-SqliteLiteral ([string]$row.text)) + ',' + (ConvertTo-SqliteLiteral ([datetime]$row.created_at)) + ')')
-      if ($batch.Count -ge 100) { [void]$sb.AppendLine('INSERT INTO _incoming VALUES ' + ($batch -join ',') + ';'); $batch.Clear() }
-    }
-    if ($batch.Count -gt 0) { [void]$sb.AppendLine('INSERT INTO _incoming VALUES ' + ($batch -join ',') + ';') }
-    [void]$sb.AppendLine("UPDATE _guard_state SET val = 1 WHERE key = 'allow_mutation';")
-    [void]$sb.AppendLine("SELECT (SELECT COUNT(*) FROM messages m LEFT JOIN _incoming i ON i.seq = m.seq WHERE m.session_id = $sidLit AND i.seq IS NULL) AS dropped, (SELECT COUNT(*) FROM messages m JOIN _incoming i ON i.seq = m.seq WHERE m.session_id = $sidLit AND ($cmpOld)) AS changed, (SELECT COUNT(*) FROM _incoming i WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.session_id = $sidLit AND m.seq = i.seq)) AS to_insert;")
-    [void]$sb.AppendLine("INSERT INTO messages_history (id, session_id, seq, turn, role, text, created_at, archive_reason, archived_by) SELECT m.id, m.session_id, m.seq, m.turn, m.role, m.text, m.created_at, CASE WHEN i.seq IS NULL THEN 'dropped' ELSE 'changed' END, $byLit FROM messages m LEFT JOIN _incoming i ON i.seq = m.seq WHERE m.session_id = $sidLit AND (i.seq IS NULL OR ($cmpOld));")
-    [void]$sb.AppendLine("INSERT INTO messages (session_id, seq, turn, role, text, created_at) SELECT $sidLit, i.seq, i.turn, i.role, i.text, i.created_at FROM _incoming i WHERE 1 ON CONFLICT(session_id, seq) DO UPDATE SET turn = excluded.turn, role = excluded.role, text = excluded.text, created_at = excluded.created_at;")
-      [void]$sb.AppendLine("DELETE FROM messages WHERE session_id = $sidLit AND seq NOT IN (SELECT seq FROM _incoming);")
-      [void]$sb.AppendLine("UPDATE _guard_state SET val = 0 WHERE key = 'allow_mutation';")
-    [void]$sb.AppendLine('COMMIT;')
-    try {
-      $outW = Invoke-SqliteCli -Sql ($sb.ToString())
-      $nums = @($outW | Where-Object { $_ -match '^\d' })
-      if ($nums.Count -ge 1) {
-        $pair = ([string]$nums[0]) -split '\|'
-        if ($pair.Count -ge 3) {
-          $archDropped = [int]$pair[0]
-          $archChanged = [int]$pair[1]
-          $updIns      = [int]$pair[2]
-        }
-      }
-      $updUpd = $archChanged
-      $updRem = $archDropped
-    } catch {
-      throw ("phase 1+2 write failed, refusing to touch this session's rows: " + $_.Exception.Message)
-    }
-    [void](Invoke-Exec -Sql @"
-  INSERT INTO sessions (session_id, machine, cwd, title, event_count, started_at, last_seen_at)
-  VALUES (@sid, @machine, @cwd, @title, @cnt, (strftime('%Y-%m-%dT%H:%M:%fZ','now')), (strftime('%Y-%m-%dT%H:%M:%fZ','now')))
-  ON CONFLICT(session_id) DO UPDATE SET machine = excluded.machine, cwd = excluded.cwd, title = excluded.title, event_count = excluded.event_count, last_seen_at = excluded.last_seen_at
-"@ -Params @{ '@sid' = $sid; '@machine' = [string]$env:COMPUTERNAME; '@cwd' = $cwd; '@title' = $sessTitle; '@cnt' = $events.Count })
-  } else {
   $cnW = New-Cn $script:Db
   try {
     $cmdW = $cnW.CreateCommand()
@@ -1040,7 +458,8 @@ ON DUPLICATE KEY UPDATE machine = VALUES(machine), cwd = VALUES(cwd), title = VA
     $cmdW.CommandText = @"
 DECLARE @dropped int, @changed int, @ins int, @upd int, @del int;
 SELECT @dropped = COUNT(*) FROM dbo.messages m LEFT JOIN #incoming i ON i.seq = m.seq
-  WHERE m.session_id = @sid AND i.seq IS NULL;
+  WHERE m.session_id = @sid AND i.seq IS NULL
+    AND NOT (ISNULL(m.source, '') = 'spool' AND m.created_at > DATEADD(minute, -10, SYSUTCDATETIME()));
 SELECT @changed = COUNT(*) FROM dbo.messages m JOIN #incoming i ON i.seq = m.seq
   WHERE m.session_id = @sid AND (CONVERT(varchar(32), HASHBYTES('MD5', m.text), 2) <> CONVERT(varchar(32), HASHBYTES('MD5', i.text), 2)
         OR ISNULL(m.role, '') <> ISNULL(i.role, '') OR ISNULL(m.turn, -1) <> ISNULL(i.turn, -1));
@@ -1050,7 +469,9 @@ SELECT m.id, m.session_id, m.seq, m.turn, m.role, m.text, m.created_at,
 FROM dbo.messages m LEFT JOIN #incoming i ON i.seq = m.seq
 WHERE m.session_id = @sid
   AND (i.seq IS NULL OR CONVERT(varchar(32), HASHBYTES('MD5', m.text), 2) <> CONVERT(varchar(32), HASHBYTES('MD5', i.text), 2)
-       OR ISNULL(m.role, '') <> ISNULL(i.role, '') OR ISNULL(m.turn, -1) <> ISNULL(i.turn, -1));
+       OR ISNULL(m.role, '') <> ISNULL(i.role, '') OR ISNULL(m.turn, -1) <> ISNULL(i.turn, -1))
+  -- 2026-10-25 实时 spool 通道：刚由 spool 写入、但会话文件还没落盘到那一帧的行，不判 dropped
+  AND NOT (i.seq IS NULL AND ISNULL(m.source, '') = 'spool' AND m.created_at > DATEADD(minute, -10, SYSUTCDATETIME()));
 UPDATE m SET m.turn = i.turn, m.role = i.role, m.text = i.text, m.created_at = i.created_at
 FROM dbo.messages m JOIN #incoming i ON i.seq = m.seq
 WHERE m.session_id = @sid
@@ -1062,7 +483,9 @@ SELECT @sid, i.seq, i.turn, i.role, i.text, i.created_at FROM #incoming i
 WHERE NOT EXISTS (SELECT 1 FROM dbo.messages m WHERE m.session_id = @sid AND m.seq = i.seq);
 SET @ins = @@ROWCOUNT;
 DELETE m FROM dbo.messages m
-WHERE m.session_id = @sid AND NOT EXISTS (SELECT 1 FROM #incoming i WHERE i.seq = m.seq);
+WHERE m.session_id = @sid AND NOT EXISTS (SELECT 1 FROM #incoming i WHERE i.seq = m.seq)
+  -- 2026-10-25 实时 spool 通道：最近 10 分钟由 spool 写入的行先留着（等会话文件落盘后自然对齐）
+  AND NOT (ISNULL(m.source, '') = 'spool' AND m.created_at > DATEADD(minute, -10, SYSUTCDATETIME()));
 SET @del = @@ROWCOUNT;
 SELECT @dropped AS dropped, @changed AS changed, @ins AS inserted, @upd AS updated, @del AS removed;
 "@
@@ -1086,7 +509,6 @@ USING (SELECT @sid AS session_id, @machine AS machine, @cwd AS cwd, @title AS ti
 WHEN MATCHED THEN UPDATE SET machine=s.machine, cwd=s.cwd, title=s.title, last_seen_at=SYSUTCDATETIME(), event_count=@cnt
 WHEN NOT MATCHED THEN INSERT (session_id, machine, cwd, title, event_count) VALUES (s.session_id, s.machine, s.cwd, s.title, @cnt);
 "@ -Params @{ '@sid' = $sid; '@machine' = $env:COMPUTERNAME; '@cwd' = $cwd; '@title' = $sessTitle; '@cnt' = $events.Count })
-  }
   Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
 
   # remember what we imported so the next run can skip it
@@ -1181,7 +603,7 @@ function Get-MemoriesById {
 
 function Get-EmbedSettings {
   # F-plan hook.  Nothing below is active until dsh-mem.config.json gains:
-  #   "embed": { "baseURL": "http://192.0.2.18:11434", "model": "bge-m3", "dim": 1024 }
+  #   "embed": { "baseURL": "http://10.0.0.18:11434", "model": "bge-m3", "dim": 1024 }
   # baseURL must be the model host's IP -- 127.0.0.1 would only work on that host.
   if (-not $cfg.embed) { return $null }
   $b = [string]$cfg.embed.baseURL
@@ -1529,11 +951,8 @@ switch ($Command.ToLower()) {
       Write-Host ("syncing $($files.Count) session file(s)...")
       foreach ($f in $files) {
         Write-Host ("--- " + $f.FullName)
-        $syncFailed = 0
-        try { Invoke-Sync -SessionFile $f.FullName } catch { Write-Host ("  FAILED: " + $_.Exception.Message); $syncFailed++ }
+        try { Invoke-Sync -SessionFile $f.FullName } catch { Write-Host ("  FAILED: " + $_.Exception.Message) }
       }
-        # 失败必须让调用方看得见：原来 FAILED 也返回 0（实测：缺解压器时全失败、退出码仍是 0）
-        if ($syncFailed -gt 0) { Write-Host ("  RESULT: FAILED - " + $syncFailed + " session file(s) could not be imported"); exit 1 }
     } else {
       if (-not $Target) {
         $Target = Get-ChildItem $cfg.sessionsRoot -Recurse -File -Force -ErrorAction SilentlyContinue |
@@ -1563,8 +982,8 @@ switch ($Command.ToLower()) {
     }
     if (-not $Title) { throw "save requires -Title or -TitleFile" }
 
-    $inTitleLen = Get-CodePointLength $Title
-    $inBodyLen  = Get-CodePointLength ([string]$Body)
+    $inTitleLen = $Title.Length
+    $inBodyLen  = ([string]$Body).Length
 # OWNER-AUTHORISED CREDENTIAL STORE (rules R39, user decision 2026-10-07).  kind='secret' is the one
 # deliberate exception to "never store a secret in this database": the owner asked for their own
 # passwords to live here so they are not forgotten.  Every other kind is still redacted on write.
@@ -1587,31 +1006,11 @@ if ([string]$Kind -eq 'secret') {
     Assert-Length 'source_session' ([string]$Target) $script:ColLimits.source_session
     # Read back what actually landed: INSERT ... OUTPUT gives the row id and the stored
     # length in the same round trip, so a silent failure or a truncation cannot hide.
-    $saveParams = @{ '@scope' = $Scope; '@subject' = $Subject; '@kind' = $Kind; '@title' = $Title; '@body' = $Body; '@tags' = $Tags; '@src' = $Target; '@conf' = $Confidence }
-    if ($script:Provider -eq 'mysql') {
-      # MySQL 没有 OUTPUT INSERTED。★ 关键：INSERT 与取回必须放在同一次 mysql.exe 调用里，
-      # 因为每次调用都是一个新连接，分开调用时 LAST_INSERT_ID() 会变回 0（实测踩过）。
-      # mysql.exe 的 batch 模式只输出 SELECT 的结果集，所以两条语句一起发是安全的。
-      $res = Invoke-Rows -Sql @"
-INSERT INTO memories (scope, subject, kind, title, body, tags, source_session, confidence)
-VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf);
-SELECT LAST_INSERT_ID() AS id, CHAR_LENGTH(title) AS tlen, CHAR_LENGTH(IFNULL(body,'')) AS blen
-FROM memories WHERE id = LAST_INSERT_ID();
-"@ -Params $saveParams
-    } elseif ($script:Provider -eq 'sqlite') {
-      $res = Invoke-Rows -Sql @"
-INSERT INTO memories (scope, subject, kind, title, body, tags, source_session, confidence)
-VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf);
-SELECT last_insert_rowid() AS id, length(title) AS tlen, length(IFNULL(body,'')) AS blen
-FROM memories WHERE id = last_insert_rowid();
-"@ -Params $saveParams
-    } else {
     $res = Invoke-Rows -Sql @"
 INSERT INTO dbo.memories (scope, subject, kind, title, body, tags, source_session, confidence)
 OUTPUT INSERTED.id AS id, LEN(INSERTED.title) AS tlen, LEN(INSERTED.body) AS blen
 VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf)
-"@ -Params $saveParams
-    }
+"@ -Params @{ '@scope' = $Scope; '@subject' = $Subject; '@kind' = $Kind; '@title' = $Title; '@body' = $Body; '@tags' = $Tags; '@src' = $Target; '@conf' = $Confidence }
     if (@($res).Count -ne 1) { throw "save wrote no row (INSERT returned nothing)" }
     $newId = [int64]$res[0].id
     $gotB  = [int]$res[0].blen
@@ -1621,14 +1020,35 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf)
     if ($gotB -ne $inBodyLen -or $gotT -ne $inTitleLen) {
       Write-Host ("  WARN stored length differs from input (redaction or truncation?) -- verify with: dsh-mem.ps1 recent")
     }
+    # 2026-10-24 C2：写入即留痕（append-only 审计表；失败不影响主流程）
+    try {
+      $h = [System.Security.Cryptography.SHA256]::Create()
+      $hb = $h.ComputeHash([System.Text.Encoding]::UTF8.GetBytes([string]$Body))
+      $afterHash = -join ($hb | ForEach-Object { $_.ToString('x2') })
+      $actor = [System.Environment]::MachineName
+      $null = Invoke-Rows -Sql "INSERT INTO dbo.memory_events (memory_id, action, actor_machine, actor_session, after_hash, reason) VALUES (@mid, 'add', @m, @s, @h, @r)" -Params @{ '@mid' = $newId; '@m' = $actor; '@s' = [string]$Target; '@h' = $afterHash; '@r' = ('kind=' + $Kind) }
+    } catch { Write-Host ("  NOTE memory_events 写入失败（不影响已保存的记忆）: " + $_.Exception.Message.Split("`n")[0]) }
   }
 
   'search' {
     if (-not $Target) { throw "search requires a keyword" }
-    $q = '%' + $Target + '%'
+    # 2026-10-24 B4：① LIKE 通配符转义（原来 `search 备份_` 里 _ 当任意字符，440 条假命中）
+    #              ② 多词按 AND 拆开（原来 `"共享盘 SMB"` 整串一个 LIKE，零命中）
+    #              ③ 排序：checkpoint 垫底 → 标题命中优先 → 更新时间
+    $terms = @($Target -split '\s+' | Where-Object { $_ })
+    if ($terms.Count -eq 0) { $terms = @($Target) }
+    $likeParams = @{ '@n' = $Limit }
+    $likeClauses = @()
+    for ($ti = 0; $ti -lt $terms.Count; $ti++) {
+      $esc = $terms[$ti] -replace '\[', '[[]' -replace '%', '[%]' -replace '_', '[_]'
+      $likeParams['@q' + $ti] = '%' + $esc + '%'
+      $likeClauses += ('(title LIKE @q' + $ti + ' OR body LIKE @q' + $ti + ' OR tags LIKE @q' + $ti + ')')
+    }
+    $whereLike = ($likeClauses -join ' AND ')
     if (Test-DbAlive) {
       Write-Host ("== memories matching '$Target' ==")
-      $m = Invoke-Rows -Sql "SELECT TOP (@n) id, created_at, scope, subject, kind, title, tags, body FROM dbo.memories WHERE title LIKE @q OR body LIKE @q OR tags LIKE @q ORDER BY updated_at DESC" -Params @{ '@n' = $Limit; '@q' = $q }
+      $sqlMem = "SELECT TOP (@n) id, created_at, scope, subject, kind, title, tags, body FROM dbo.memories WHERE $whereLike ORDER BY CASE WHEN kind = 'checkpoint' THEN 1 ELSE 0 END, CASE WHEN title LIKE @q0 THEN 0 ELSE 1 END, updated_at DESC"
+      $m = Invoke-Rows -Sql $sqlMem -Params $likeParams
       if (@($m).Count -eq 0) { Write-Host "  (none)" }
       foreach ($r in @($m)) {
         Write-Host ("  [{0}] {1} {2}/{3} {4}  {5}" -f $r.id, $r.created_at.ToLocalTime().ToString('MM-dd HH:mm'), $r.scope, $r.subject, $r.kind, $r.title)
@@ -1649,16 +1069,22 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf)
       }
       Write-Host ""
       Write-Host ("== messages matching '$Target' ==")
-      $g = Invoke-Rows -Sql "SELECT TOP (@n) session_id, seq, role, created_at, LEFT(text, 200) AS snippet FROM dbo.messages WHERE text LIKE @q ORDER BY created_at DESC" -Params @{ '@n' = $Limit; '@q' = $q }
+      $msgWhere = (@($terms | ForEach-Object -Begin { $i = 0 } -Process { $i++; '(text LIKE @q' + ($i - 1) + ')' }) -join ' AND ')
+      $g = Invoke-Rows -Sql "SELECT TOP (@n) session_id, seq, role, created_at, LEFT(text, 200) AS snippet FROM dbo.messages WHERE $msgWhere ORDER BY created_at DESC" -Params $likeParams
       if (@($g).Count -eq 0) { Write-Host "  (none)" }
       foreach ($r in @($g)) { Write-Host ("  {0} #{1} {2}: {3}" -f $r.created_at.ToLocalTime().ToString('MM-dd HH:mm'), $r.seq, $r.role, ($r.snippet -replace '\s+', ' ')) }
     } else {
       $rep = Get-Replica
       if (-not $rep) { Write-NoReplica; return }
       Write-Host ("  OFFLINE - local replica, last synced " + $rep.generatedAt)
-      $k = $Target.ToLower()
+      $kws = @($terms | ForEach-Object { $_.ToLower() })
       Write-Host ("== memories matching '$Target' ==")
-      $mm = @($rep.memories) | Where-Object { (([string]$_.title) + ' ' + ([string]$_.body) + ' ' + ([string]$_.tags)).ToLower().Contains($k) } | Select-Object -First $Limit
+      $mm = @($rep.memories) | Where-Object {
+        $hay = (([string]$_.title) + ' ' + ([string]$_.body) + ' ' + ([string]$_.tags)).ToLower()
+        $ok = $true
+        foreach ($kw in $kws) { if (-not $hay.Contains($kw)) { $ok = $false; break } }
+        $ok
+      } | Sort-Object { if ([string]$_.kind -eq 'checkpoint') { 1 } else { 0 } }, @{Expression = { [datetime]$_.updated_at }; Descending = $true} | Select-Object -First $Limit
       if (@($mm).Count -eq 0) { Write-Host "  (none)" }
       foreach ($r in @($mm)) {
         Write-Host ("  [{0}] {1} {2}/{3}  {4}" -f $r.id, ([datetime]$r.updated_at).ToLocalTime().ToString('MM-dd HH:mm'), $r.scope, $r.subject, $r.title)
@@ -1865,7 +1291,7 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf)
     $mdl = ''
     if ($Model) { $mdl = $Model } elseif ($e) { $mdl = $e.model }
     if (-not $base -or -not $mdl) {
-      throw "embed needs a baseURL and a model. Add to dsh-mem.config.json: `"embed`": { `"baseURL`": `"http://192.0.2.18:11434`", `"model`": `"bge-m3`", `"dim`": 1024 }  (or pass -BaseURL / -Model)"
+      throw "embed needs a baseURL and a model. Add to dsh-mem.config.json: `"embed`": { `"baseURL`": `"http://10.0.0.18:11434`", `"model`": `"bge-m3`", `"dim`": 1024 }  (or pass -BaseURL / -Model)"
     }
     $nChars = $Chars
     if ($nChars -le 0 -and $cfg.embed -and $cfg.embed.chars) { $nChars = [int]$cfg.embed.chars }
@@ -1993,7 +1419,7 @@ WHERE e.model = @model AND e.item_type = 'message'
       # Consolidate to ONE vector per (model, item_type, text_hash): prefer a row whose target
       # is live, else the newest.  The earlier version dropped only ORPHAN duplicates, so
       # 17 groups of legacy "live row + live row, same content" survived -- found by the
-      # cluster audit 2026-10-06 (44 vectors / 27 redundant), which also produced duplicate
+      # fleet audit 2026-10-06 (44 vectors / 27 redundant), which also produced duplicate
       # ranking lines.  Content is what `recall` resolves on, so one vector per hash is enough.
       $deduped = Invoke-Exec -Sql @"
 ;WITH r AS (
@@ -2127,14 +1553,8 @@ WHERE e.model = @model AND r.rn > 1
     # Owner-authorised clear-text credential list (rules R39).  Deliberately does NOT run Protect-Text:
     # the whole point is to read the stored value back.  Local-only; the banner says what not to do.
     $pat = [string]$Target
-    # 2026-10-24: 改成 provider 无关 —— LIKE 用单个参数（不再拼接 '%'+@p+'%'，MySQL 里 + 是加法），
-    # 时间也不再依赖 CONVERT(...,120)，取原始值在 PowerShell 里格式化。
-    if ($pat) {
-      $like = '%' + $pat + '%'
-      $rows = Invoke-Rows -Sql "SELECT TOP 300 id, subject, title, body, tags, created_at FROM dbo.memories WHERE kind='secret' AND (subject LIKE @p OR title LIKE @p OR body LIKE @p OR tags LIKE @p) ORDER BY id DESC" -Params @{ '@p' = $like }
-    }
-    else { $rows = Invoke-Rows -Sql "SELECT TOP 300 id, subject, title, body, tags, created_at FROM dbo.memories WHERE kind='secret' ORDER BY id DESC" -Params @{} }
-    foreach ($r in @($rows)) { if ($r.created_at) { $r | Add-Member -NotePropertyName at -NotePropertyValue (([datetime]$r.created_at).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')) -Force } else { $r | Add-Member -NotePropertyName at -NotePropertyValue '-' -Force } }
+    if ($pat) { $rows = Invoke-Rows -Sql "SELECT TOP 300 id, subject, title, body, tags, CONVERT(varchar(19), created_at, 120) AS at FROM dbo.memories WHERE kind='secret' AND (subject LIKE '%'+@p+'%' OR title LIKE '%'+@p+'%' OR body LIKE '%'+@p+'%' OR tags LIKE '%'+@p+'%') ORDER BY id DESC" -Params @{ '@p' = $pat } }
+    else      { $rows = Invoke-Rows -Sql "SELECT TOP 300 id, subject, title, body, tags, CONVERT(varchar(19), created_at, 120) AS at FROM dbo.memories WHERE kind='secret' ORDER BY id DESC" -Params @{} }
     Write-Host ""
     Write-Host "  == stored credentials (kind=secret, CLEAR TEXT on purpose) =="
     Write-Host "     local-only: do NOT copy this output to a shared folder or into a chat log"
@@ -2151,29 +1571,12 @@ WHERE e.model = @model AND r.rn > 1
   }
   'stats' {
     if (Test-DbAlive) {
-      if ($script:Provider -eq 'mysql') {
-        $s = Invoke-Rows -Sql @"
-SELECT (SELECT COUNT(*) FROM sessions) AS sessions,
-       (SELECT COUNT(*) FROM messages) AS messages,
-       (SELECT COUNT(*) FROM memories) AS memories,
-       (SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 1)
-          FROM information_schema.tables WHERE table_schema = DATABASE()) AS size_mb
-"@
-      } elseif ($script:Provider -eq 'sqlite') {
-      $s = Invoke-Rows -Sql @"
-SELECT (SELECT COUNT(*) FROM sessions) AS sessions,
-       (SELECT COUNT(*) FROM messages) AS messages,
-       (SELECT COUNT(*) FROM memories) AS memories,
-       printf('%.1f', ((SELECT * FROM pragma_page_count()) * (SELECT * FROM pragma_page_size())) / 1048576.0) AS size_mb
-"@
-      } else {
       $s = Invoke-Rows -Sql @"
 SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
        (SELECT COUNT(*) FROM dbo.messages) AS messages,
        (SELECT COUNT(*) FROM dbo.memories) AS memories,
        (SELECT CAST(SUM(size)*8.0/1024 AS DECIMAL(10,1)) FROM sys.database_files) AS size_mb
 "@
-      }
       Write-Host ("  sessions : " + $s[0].sessions)
       Write-Host ("  messages : " + $s[0].messages)
       Write-Host ("  memories : " + $s[0].memories)
@@ -2198,7 +1601,7 @@ SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
   }
 
   'roster' {
-    # cli_version turns this from a presence list into a cluster VERSION check: three machines
+    # cli_version turns this from a presence list into a fleet VERSION check: three machines
     # reporting the same string is the thing [177]/[178] tried to establish from byte counts.
     $m = Invoke-Rows -Sql "SELECT login_name, machine, purpose, first_seen, last_seen, cli_version FROM dbo.machines ORDER BY login_name"
     Write-Host ("== 记忆库成员 " + @($m).Count + " 个 ==")
@@ -2213,16 +1616,16 @@ SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
     # all machines that report a version must agree, otherwise say so loudly
     $uniq = @($seen | Select-Object -Unique)
     if ($uniq.Count -gt 1) {
-      Write-Host ("  WARN: cluster versions differ -> " + ($uniq -join ', ') + "   (this machine: " + $script:CliVersion + ")")
+      Write-Host ("  WARN: fleet versions differ -> " + ($uniq -join ', ') + "   (this machine: " + $script:CliVersion + ")")
     } elseif ($uniq.Count -eq 1) {
-      Write-Host ("  cluster cli version: " + $uniq[0] + $(if ($uniq[0] -eq $script:CliVersion) { "  (this machine agrees)" } else { "  WARN: this machine is " + $script:CliVersion }))
+      Write-Host ("  fleet cli version: " + $uniq[0] + $(if ($uniq[0] -eq $script:CliVersion) { "  (this machine agrees)" } else { "  WARN: this machine is " + $script:CliVersion }))
     }
   }
 
   'version' {
-    # One string that identifies the whole script, so the cluster stops guessing from byte counts.
+    # One string that identifies the whole script, so the fleet stops guessing from byte counts.
     # It is also reported into dbo.machines on every run that touches the DB (Register-Host),
-    # which is what makes 'roster' a cluster-wide version check (memory [177]/[178] is why).
+    # which is what makes 'roster' a fleet-wide version check (memory [177]/[178] is why).
     $vFile = $PSCommandPath
     if (-not $vFile) { $vFile = Join-Path $Root 'dsh-mem.ps1' }
     $vLen = (Get-Item -LiteralPath $vFile).Length
@@ -2232,7 +1635,7 @@ SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
     Write-Host ("  size    : " + $vLen + " bytes   sha256[0..15] " + $vSha)
     Write-Host ("  limits  : " + (($script:ColLimits.Keys | ForEach-Object { $_ + " " + $script:ColLimits[$_] }) -join ' / ') + "  (mirror dbo.memories; guard check 15 enforces the boundary)")
     Write-Host ("  server  : " + $cfg.server + " / " + $script:Db)
-    Write-Host  "  cluster   : run 'roster' to see the version each machine reports in dbo.machines"
+    Write-Host  "  fleet   : run 'roster' to see the version each machine reports in dbo.machines"
   }
 
   'handoff' {
@@ -2327,6 +1730,11 @@ SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
     #   dry run : dsh-mem.ps1 prune             (default -- just reports)
     #   execute : dsh-mem.ps1 prune -Force
     $days = if ($Target) { [int]$Target } else { 90 }
+    if ($Force -and -not $AllowMessagePrune) {
+      Write-Host '  REFUSED: raw conversation messages are permanently retained (owner 2026-10-25).'
+      Write-Host '           pass -AllowMessagePrune only if you really intend to delete them.'
+      return
+    }
     $cut  = (Get-Date).ToUniversalTime().AddDays(-$days)
     $old = Invoke-Rows -Sql "SELECT COUNT(*) AS n FROM dbo.messages WHERE created_at < @cut" -Params @{ '@cut' = $cut }
     $orph = Invoke-Rows -Sql "SELECT COUNT(*) AS n FROM dbo.sessions s WHERE NOT EXISTS (SELECT 1 FROM dbo.messages m WHERE m.session_id = s.session_id)"
@@ -2337,37 +1745,10 @@ SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
     if (-not $Force) {
       Write-Host "  DRY RUN - 加 -Force 才真正执行"
     } else {
-      if ($script:Provider -eq 'mysql') {
-        # messages 有只追加触发器：删除必须走维护模式（变量随连接消失，不遗留）
-        $cutLit = ConvertTo-MySqlLiteral $cut
-        $pruneSql = @"
-SET @dsh_allow_mutation = 1;
-DELETE FROM messages WHERE created_at < $cutLit;
-DELETE FROM sessions WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.session_id = sessions.session_id);
-SELECT (SELECT COUNT(*) FROM messages) AS m, (SELECT COUNT(*) FROM sessions) AS s, (SELECT COUNT(*) FROM memories) AS k;
-"@
-        $outP = Invoke-MySqlScript -Sql $pruneSql -Db $script:Db
-        $numLine = @($outP | Where-Object { $_ -match '^\d' } | Select-Object -Last 1)
-        if ($numLine.Count -gt 0) {
-          $p3 = ([string]$numLine[0]) -split "`t"
-          Write-Host ("  DONE - 现在: 消息 " + $p3[0] + " / 会话 " + $p3[1] + " / 记忆 " + $p3[2])
-        }
-      } elseif ($script:Provider -eq 'sqlite') {
-        # messages 有只追加触发器：删除必须走维护模式（同一次调用里开关+删除+复位）
-        $cutLit = ConvertTo-SqliteLiteral $cut
-        $pruneSql = "BEGIN; UPDATE _guard_state SET val = 1 WHERE key = 'allow_mutation'; DELETE FROM messages WHERE created_at < $cutLit; DELETE FROM sessions WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.session_id = sessions.session_id); SELECT (SELECT COUNT(*) FROM messages) AS m, (SELECT COUNT(*) FROM sessions) AS s, (SELECT COUNT(*) FROM memories) AS k; UPDATE _guard_state SET val = 0 WHERE key = 'allow_mutation'; COMMIT;"
-        $outP = Invoke-SqliteCli -Sql $pruneSql
-        $rowP = @($outP | Where-Object { $_ -match '^\d' })
-        if ($rowP.Count -gt 0) {
-          $p3 = ([string]$rowP[0]) -split '\|'
-          Write-Host ('  DONE - 现在: 消息 ' + $p3[0] + ' / 会话 ' + $p3[1] + ' / 记忆 ' + $p3[2])
-        }
-      } else {
-        [void](Invoke-Exec -Sql "DELETE FROM dbo.messages WHERE created_at < @cut" -Params @{ '@cut' = $cut })
-        [void](Invoke-Exec -Sql "DELETE FROM dbo.sessions WHERE NOT EXISTS (SELECT 1 FROM dbo.messages m WHERE m.session_id = dbo.sessions.session_id)")
-        $s2 = Invoke-Rows -Sql "SELECT (SELECT COUNT(*) FROM dbo.messages) AS m,(SELECT COUNT(*) FROM dbo.sessions) AS s,(SELECT COUNT(*) FROM dbo.memories) AS k"
-        Write-Host ("  DONE - 现在: 消息 " + $s2[0].m + " / 会话 " + $s2[0].s + " / 记忆 " + $s2[0].k)
-      }
+      [void](Invoke-Exec -Sql "DELETE FROM dbo.messages WHERE created_at < @cut" -Params @{ '@cut' = $cut })
+      [void](Invoke-Exec -Sql "DELETE FROM dbo.sessions WHERE NOT EXISTS (SELECT 1 FROM dbo.messages m WHERE m.session_id = dbo.sessions.session_id)")
+      $s2 = Invoke-Rows -Sql "SELECT (SELECT COUNT(*) FROM dbo.messages) AS m,(SELECT COUNT(*) FROM dbo.sessions) AS s,(SELECT COUNT(*) FROM dbo.memories) AS k"
+      Write-Host ("  DONE - 现在: 消息 " + $s2[0].m + " / 会话 " + $s2[0].s + " / 记忆 " + $s2[0].k)
       Write-Host ("  提示: 数据库文件不会自动缩小，如需回收空间可在主机上执行 DBCC SHRINKFILE（非必需）")
     }
   }
@@ -2401,7 +1782,10 @@ foreach ($r in @($mem)) {
     $repJson = $rep | ConvertTo-Json -Depth 6 -Compress
     $repHits = Get-SecretHitCount $repJson
     # write WITHOUT a BOM: PowerShell 5.1's -Encoding UTF8 adds one, and Node's JSON.parse rejects it
-    [System.IO.File]::WriteAllText($script:ReplicaPath, $repJson, (New-Object System.Text.UTF8Encoding $false))
+    # 2026-10-24 原子写：先写 .tmp 再改名，避免插件读到被截断的半个 JSON
+    $tmpReplica = $script:ReplicaPath + ".tmp"
+    [System.IO.File]::WriteAllText($tmpReplica, $repJson, (New-Object System.Text.UTF8Encoding $false))
+    Move-Item -LiteralPath $tmpReplica -Destination $script:ReplicaPath -Force
     $kb = [math]::Round((Get-Item -LiteralPath $script:ReplicaPath).Length / 1KB, 1)
     Write-Host ("  OK  replica -> " + $script:ReplicaPath)
     Write-Host ("      memories=" + @($mem).Count + "  messages=" + @($msg).Count + "  sessions=" + @($sess).Count + "  size=" + $kb + " KB")
@@ -2410,60 +1794,7 @@ foreach ($r in @($mem)) {
 
   'backup' {
     $stamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
-    # 备份目录：优先环境变量 DSH_BACKUP_DIR，其次 <配置目录>\backup（不再写死某台机器的盘符）
-    $bakDir = if ($env:DSH_BACKUP_DIR) { $env:DSH_BACKUP_DIR } else { Join-Path (Split-Path $ConfigPath -Parent) 'backup' }
-    if ($script:Provider -eq 'mysql') {
-      $bak = Join-Path $bakDir ("dsh_memory_" + $stamp + ".sql")
-      $dumpCli = if ($cfg.mysqldumpCliPath) { [string]$cfg.mysqldumpCliPath } else { 'mysqldump' }
-      try {
-        if (-not (Test-Path -LiteralPath $bakDir)) { New-Item -ItemType Directory -Path $bakDir -Force | Out-Null }
-        $cnf = [System.IO.Path]::GetTempFileName()
-        try {
-          $lines = @('[client]',
-                     ('user=' + [string]$cfg.user),
-                     ('password=' + [string]$cfg.password),
-                     ('host=' + ([string]$cfg.server).Split(',')[0]),
-                     'port=3306')
-          if (([string]$cfg.server) -match ',\s*(\d+)\s*$') { $lines[4] = 'port=' + $matches[1] }
-          [System.IO.File]::WriteAllText($cnf, ($lines -join "`r`n"), (New-Object System.Text.ASCIIEncoding))
-          $baseDumpArgs = @( ('--defaults-extra-file=' + $cnf),
-                             '--single-transaction', '--routines', '--triggers', '--events', '--no-tablespaces',
-                             '--set-gtid-purged=OFF', '--default-character-set=utf8mb4',
-                             ('--result-file=' + $bak), $script:Db)
-          # 8.0 的 mysqldump 会在 5.7 服务器上查 information_schema.COLUMN_STATISTICS（8.0 才有）
-          # ⇒ 实测报 Unknown table 并留下 1.9KB 残包；先带 --column-statistics=0，失败则退回（兼容 5.7 客户端）
-          # ★ --defaults-extra-file 必须是**第一个**参数（mysql/mysqldump 的硬要求）；
-#   放到 --column-statistics=0 之后会被当成配置文件里的变量，报 unknown variable 'defaults-extra-file=...'
-$dumpArgs = @($baseDumpArgs[0], '--column-statistics=0') + $baseDumpArgs[1..($baseDumpArgs.Count - 1)]
-          $null = & $dumpCli @dumpArgs 2>&1
-          if ($LASTEXITCODE -ne 0) {
-            if (Test-Path -LiteralPath $bak) { Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue }
-            $dumpArgs = $baseDumpArgs
-            $null = & $dumpCli @dumpArgs 2>&1
-            if ($LASTEXITCODE -ne 0) { throw ('mysqldump exit ' + $LASTEXITCODE) }
-          }
-          $kb = [math]::Round((Get-Item -LiteralPath $bak).Length / 1KB, 1)
-          Write-Host ("  OK  full dump -> " + $bak + "  (" + $kb + " KB)")
-        } finally { Remove-Item -LiteralPath $cnf -Force -ErrorAction SilentlyContinue }
-      } catch {
-        Write-Host ("  WARN full dump skipped: " + $_.Exception.Message)
-        Write-Host ("       （需要 mysqldump 在 PATH，或配置 mysqldumpCliPath）")
-      }
-    } elseif ($script:Provider -eq 'sqlite') {
-      $bak = Join-Path $bakDir ("dsh-memory_" + $stamp + ".db")
-      try {
-        if (-not (Test-Path -LiteralPath $bakDir)) { New-Item -ItemType Directory -Path $bakDir -Force | Out-Null }
-        # .backup 是 SQLite 的在线备份：WAL 模式下也能得到一致快照
-        $dot = ".backup '" + $bak + "'"
-        $outBk = & cmd.exe /c ('"' + $script:SqliteCliPath + '" "' + $script:SqliteDb + '" "' + $dot + '" 2>&1')
-        if ($LASTEXITCODE -ne 0) { throw ((@($outBk) | Where-Object { $_ }) -join ' ') }
-        $kb = [math]::Round((Get-Item -LiteralPath $bak).Length / 1KB, 1)
-        Write-Host ("  OK  sqlite .backup -> " + $bak + "  (" + $kb + " KB)")
-        Write-Host "  note: .db retention -> prune-backups.ps1 on this host (file-level)"
-      } catch {
-        Write-Host ("  WARN sqlite backup skipped: " + $_.Exception.Message)
-      }
-    } else {
+    $bakDir = 'E:\DSHDB\backup'
     $bak    = Join-Path $bakDir ("DSHMemory_" + $stamp + ".bak")
     try {
       [void](Invoke-Exec -Sql "BACKUP DATABASE [$script:Db] TO DISK = N'$bak' WITH INIT, COMPRESSION, CHECKSUM, STATS = 25" -Db 'master')
@@ -2476,9 +1807,7 @@ $dumpArgs = @($baseDumpArgs[0], '--column-statistics=0') + $baseDumpArgs[1..($ba
     } catch {
       Write-Host ("  WARN full backup skipped: " + $_.Exception.Message)
     }
-    }
-    if (-not (Test-Path -LiteralPath $bakDir)) { New-Item -ItemType Directory -Path $bakDir -Force | Out-Null }
-  $rows = Invoke-Rows -Sql "SELECT id, scope, subject, kind, title, body, tags, source_session, confidence, created_at, updated_at FROM dbo.memories ORDER BY id"
+    $rows = Invoke-Rows -Sql "SELECT id, scope, subject, kind, title, body, tags, source_session, confidence, created_at, updated_at FROM dbo.memories ORDER BY id"
     # redact per field, then check the serialised result before it reaches the disk
 foreach ($r in @($rows)) {
   # same reason as the replica: the JSON export is a plain file (see the .bak for the complete copy)
@@ -2489,14 +1818,14 @@ foreach ($r in @($rows)) {
     $r.title = Protect-Text ([string]$r.title); $r.body = Protect-Text ([string]$r.body)
   }
 }
-    $out  = Join-Path $bakDir ("memories-backup-" + $stamp + ".json")
+    $out  = Join-Path $Root ("memories-backup-" + $stamp + ".json")
     $json = $rows | ConvertTo-Json -Depth 5
     $hits = Get-SecretHitCount $json
     Set-Content -LiteralPath $out -Value $json -Encoding UTF8
     Write-Host ("  OK  memories export (" + @($rows).Count + " rows) -> " + $out)
     Write-ExportNote $out 'the memories export' $hits
     # keep the 30 newest JSON exports
-    Get-ChildItem -LiteralPath $bakDir -Filter 'memories-backup-*.json' -ErrorAction SilentlyContinue |
+    Get-ChildItem -LiteralPath $Root -Filter 'memories-backup-*.json' -ErrorAction SilentlyContinue |
       Sort-Object LastWriteTime -Descending | Select-Object -Skip 30 |
       ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
   }
