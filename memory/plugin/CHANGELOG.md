@@ -5,9 +5,6 @@
 
 ## [0.5.2] — 2026-10-25（开源发布）
 
-> 说明：v0.5.1 这个标签今天早些时候已用于"修复自报版本常量（0.4.2 → 0.5.0）"，
-> 因此本次（state card + anchor + 回退修复）改用 **v0.5.2**。
-
 ### 新增：让记忆**可追溯**，而不只是可注入
 
 - **状态卡（state card）**：从 `stateDir`（默认 `C:\dsh-mem\sessions`）读取最近更新的会话状态文件，
@@ -36,12 +33,6 @@ BUDGET_FLOOR shards 700 ｜ state 1200 ｜ anchor 350 ｜ recall 500 ｜ pinned 
 ```
 
 超限时的丢弃顺序仍为 `recent → activity → pinned → shards → recall`，**不先砍 hints**。
-
-### 安全与脱敏
-
-- 对外发布前已移除示例中的本地地址与主机标识：`ollamaUrl` 默认值改为 `127.0.0.1`，
-  示例文案不再包含具体主机名/GPU 型号；真实地址一律由配置提供。
-- `docs/08-permissions-and-antivirus.md` 中的示例路径改为 `C:\Users\<用户名>` 形式。
 
 ---
 ## [0.5.0] — 2026-10-24（内部，未发布）
