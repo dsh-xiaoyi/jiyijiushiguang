@@ -9,7 +9,7 @@
 )
 # 2026-10-24 C3 后续：curator 的"只提案"版本。
 # 读最近的 evidence（会话压缩摘要）+ 与之最相近的既有记忆，产出一份**人类可读的提案报告**。
-# 绝对不写数据库：所有候选操作只写进报告文件，等主人（或小易审核后）决定。
+# 绝对不写数据库：所有候选操作只写进报告文件，等用户（或运维审核后）决定。
 $ErrorActionPreference = 'Continue'
 Add-Type -AssemblyName System.Data
 if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
@@ -69,7 +69,7 @@ if ($ev.Rows.Count -eq 0) {
             foreach ($t in $top) { $lines.Add('    - [' + $t.id + '] (' + $t.kind + ') ' + $t.title + '  ← 重叠 ' + $t.score) }
             $lines.Add('- 建议动作：**MERGE**（与上面第一条合并）或 **NOOP**（若只是过程记录）')
         }
-        $lines.Add('- 需要主人/小易决定：这条证据里有没有"值得长期记住的结论"？')
+        $lines.Add('- 需要用户/运维决定：这条证据里有没有"值得长期记住的结论"？')
         $lines.Add('')
     }
 }
