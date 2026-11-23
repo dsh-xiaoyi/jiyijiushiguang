@@ -9,6 +9,7 @@
                                   rows are updated in place, and rows the log no longer has
                                   are archived to dbo.messages_history before removal
     save    -Title .. -Body .. [-Tags a,b] [-Scope machine] [-Subject X] [-Kind fact]
+            [-Valence 0-10] [-Situation <text>]
             -TitleFile <f> -BodyFile <f>   safer for long text / text containing quotes
     embed   [-Limit N] [-Model m] [-Reembed] [-Chars N] [-BaseURL u]
                                   fill dbo.embeddings (F plan).  Idempotent: only rows
@@ -20,6 +21,7 @@
                                   semantic (F plan); otherwise an explicit DEGRADED
                                   fallback to literal LIKE + [-Context] turns
     recent  [-Limit 20]
+    mood                            read 4 internal mood states + silence drift
     stats
     history [-Session <sid>] [-Seq <n>] [-Limit 20]
                                   read the append-only archive of everything sync had to
@@ -71,6 +73,9 @@ param(
   [string]$Subject = $env:COMPUTERNAME,
   [string]$Kind = 'fact',
   [int]$Confidence = 80,
+  # [VALENCE-CONTEXT-20261119] 情绪价 + 处境上下文（与 dbo.memories 的 valence/context 两列对应）
+  [int]$Valence = -1,      # 情绪价 0-10（0=负面 5=中性 10=正面；-1=未提供→NULL）
+  [string]$Situation = '', # 当时的处境/感受（空=未提供）
   [int]$Limit = 20,
   [int]$Context = 2,
   [int]$ReplicaMessages = 3000,
@@ -1182,6 +1187,66 @@ function Get-MemoriesById {
   return $r
 }
 
+# ============================================================================
+#  四阶段 + FTS 检索（三方言显式分支，不靠 regex 翻译层转 FTS 语法）
+#   [ACCESS-REINFORCE-20261119] 访问加固：命中记忆 access_count+1 / last_injected_at
+#   [VALENCE-CONTEXT-20261119]  情绪价 + 处境上下文：memories.valence / memories.context
+#   [CO-OCCUR-20261119]         共现互链：memory_refs 表，两两记共现边 weight+1
+#   [MOOD-20261119]             情绪状态：agent_state 表 4 状态 + 静默漂移
+#   [FTS-SQLSERVER-20261123]    全文检索：FREETEXTTABLE（LANGUAGE 2052）
+#   [FTS-MYSQL-20261123]        全文检索：MATCH ... AGAINST（FULLTEXT INDEX）
+#   [FTS-SQLITE-20261123]       全文检索：FTS5 虚拟表 fts5 + MATCH
+# ============================================================================
+
+function Invoke-MemoryFts {
+  # [FTS-SQLSERVER-20261123] / [FTS-MYSQL-20261123] / [FTS-SQLITE-20261123]
+  # memories 全文检索回退（LIKE 0 命中才调用）：FREETEXTTABLE / MATCH / fts5 三方言各写各的。
+  param([string]$Target, [int]$Limit)
+  $sql = switch ($script:Provider) {
+    'mysql'   { "SELECT m.id, m.created_at, m.scope, m.subject, m.kind, m.title, m.tags, m.body FROM memories m WHERE MATCH(m.title, m.body, m.tags) AGAINST (@fts IN NATURAL LANGUAGE MODE) ORDER BY m.access_count DESC, m.updated_at DESC LIMIT @n" }
+    'sqlite'  { "SELECT m.id, m.created_at, m.scope, m.subject, m.kind, m.title, m.tags, m.body FROM memories_fts JOIN memories m ON m.id = memories_fts.rowid WHERE memories_fts MATCH @fts ORDER BY m.access_count DESC, m.updated_at DESC LIMIT @n" }
+    default   { "SELECT TOP (@n) m.id, m.created_at, m.scope, m.subject, m.kind, m.title, m.tags, m.body FROM FREETEXTTABLE(dbo.memories, (title, body, tags), @fts) ct JOIN dbo.memories m ON m.id = ct.[KEY] ORDER BY ct.RANK DESC, m.access_count DESC, m.updated_at DESC" }
+  }
+  $r = Invoke-Rows -Sql $sql -Params @{ '@n' = $Limit; '@fts' = $Target }
+  return $r
+}
+
+function Invoke-MessageFtsCandidates {
+  # [FTS-SQLSERVER-20261123] / [FTS-MYSQL-20261123] / [FTS-SQLITE-20261123]
+  # messages 两阶段第一步：全文检索取候选（上限 Max($Limit*4,40)）。
+  # FREETEXTTABLE / MATCH ... AGAINST / fts5 三方言各写各的，返回完整 text 供内存精确过滤。
+  param([string]$Target, [int]$Limit)
+  $sql = switch ($script:Provider) {
+    'mysql'   { "SELECT m.id, m.session_id, m.seq, m.role, m.created_at, m.text FROM messages m WHERE MATCH(m.text) AGAINST (@fts IN NATURAL LANGUAGE MODE) ORDER BY m.created_at DESC LIMIT @n" }
+    'sqlite'  { "SELECT m.id, m.session_id, m.seq, m.role, m.created_at, m.text FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid WHERE messages_fts MATCH @fts ORDER BY m.created_at DESC LIMIT @n" }
+    default   { "SELECT TOP (@n) m.id, m.session_id, m.seq, m.role, m.created_at, m.text FROM FREETEXTTABLE(dbo.messages, (text), @fts) ft JOIN dbo.messages m ON m.id = ft.[KEY] ORDER BY ft.RANK DESC, m.created_at DESC" }
+  }
+  $r = Invoke-Rows -Sql $sql -Params @{ '@n' = $Limit; '@fts' = $Target }
+  return $r
+}
+
+function Invoke-CoOccur {
+  # [CO-OCCUR-20261119] 共现互链（回忆重建）：同一次查询同时命中的记忆（取前 5），
+  # 两两记一条共现边、weight+1。三方言原子 upsert：
+  #   SQL Server：UPDATE + IF @@ROWCOUNT=0 INSERT；MySQL：ON DUPLICATE KEY UPDATE；
+  #   SQLite：ON CONFLICT DO UPDATE（后两者依赖 memory_refs 的 UNIQUE(memory_id,cited_id,relation)）。
+  param([object[]]$HitIds)
+  $hitIds = @($HitIds | ForEach-Object { [int64]$_ })
+  if ($hitIds.Count -lt 2) { return }
+  $top = @($hitIds | Select-Object -First 5)
+  $upSql = switch ($script:Provider) {
+    'mysql'   { "INSERT INTO memory_refs (memory_id, cited_id, relation, weight) VALUES (@lo, @hi, 'cooccurs', 1) ON DUPLICATE KEY UPDATE weight = weight + 1" }
+    'sqlite'  { "INSERT INTO memory_refs (memory_id, cited_id, relation, weight) VALUES (@lo, @hi, 'cooccurs', 1) ON CONFLICT(memory_id, cited_id, relation) DO UPDATE SET weight = weight + 1" }
+    default   { "UPDATE dbo.memory_refs SET weight = weight + 1 WHERE memory_id = @lo AND cited_id = @hi AND relation = 'cooccurs'; IF @@ROWCOUNT = 0 INSERT INTO dbo.memory_refs (memory_id, cited_id, relation, weight) VALUES (@lo, @hi, 'cooccurs', 1);" }
+  }
+  for ($i = 0; $i -lt $top.Count; $i++) {
+    for ($j = $i + 1; $j -lt $top.Count; $j++) {
+      $lo = [Math]::Min($top[$i], $top[$j]); $hi = [Math]::Max($top[$i], $top[$j])
+      $null = Invoke-Exec -Sql $upSql -Params @{ '@lo' = $lo; '@hi' = $hi }
+    }
+  }
+}
+
 function Get-EmbedSettings {
   # F-plan hook.  Nothing below is active until dsh-mem.config.json gains:
   #   "embed": { "baseURL": "http://192.0.2.18:11434", "model": "bge-m3", "dim": 1024 }
@@ -1590,29 +1655,30 @@ if ([string]$Kind -eq 'secret') {
     Assert-Length 'source_session' ([string]$Target) $script:ColLimits.source_session
     # Read back what actually landed: INSERT ... OUTPUT gives the row id and the stored
     # length in the same round trip, so a silent failure or a truncation cannot hide.
-    $saveParams = @{ '@scope' = $Scope; '@subject' = $Subject; '@kind' = $Kind; '@title' = $Title; '@body' = $Body; '@tags' = $Tags; '@src' = $Target; '@conf' = $Confidence }
+    # [VALENCE-CONTEXT-20261119] -1 → NULL（未提供），空字符串 → NULL；落到 memories.valence / memories.context
+    $saveParams = @{ '@scope' = $Scope; '@subject' = $Subject; '@kind' = $Kind; '@title' = $Title; '@body' = $Body; '@tags' = $Tags; '@src' = $Target; '@conf' = $Confidence; '@valence' = $Valence; '@context' = $Situation }
     if ($script:Provider -eq 'mysql') {
       # MySQL 没有 OUTPUT INSERTED。★ 关键：INSERT 与取回必须放在同一次 mysql.exe 调用里，
       # 因为每次调用都是一个新连接，分开调用时 LAST_INSERT_ID() 会变回 0（实测踩过）。
       # mysql.exe 的 batch 模式只输出 SELECT 的结果集，所以两条语句一起发是安全的。
       $res = Invoke-Rows -Sql @"
-INSERT INTO memories (scope, subject, kind, title, body, tags, source_session, confidence)
-VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf);
+INSERT INTO memories (scope, subject, kind, title, body, tags, source_session, confidence, valence, context)
+VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf, CASE WHEN @valence = -1 THEN NULL ELSE @valence END, NULLIF(@context, ''));
 SELECT LAST_INSERT_ID() AS id, CHAR_LENGTH(title) AS tlen, CHAR_LENGTH(IFNULL(body,'')) AS blen
 FROM memories WHERE id = LAST_INSERT_ID();
 "@ -Params $saveParams
     } elseif ($script:Provider -eq 'sqlite') {
       $res = Invoke-Rows -Sql @"
-INSERT INTO memories (scope, subject, kind, title, body, tags, source_session, confidence)
-VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf);
+INSERT INTO memories (scope, subject, kind, title, body, tags, source_session, confidence, valence, context)
+VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf, CASE WHEN @valence = -1 THEN NULL ELSE @valence END, NULLIF(@context, ''));
 SELECT last_insert_rowid() AS id, length(title) AS tlen, length(IFNULL(body,'')) AS blen
 FROM memories WHERE id = last_insert_rowid();
 "@ -Params $saveParams
     } else {
     $res = Invoke-Rows -Sql @"
-INSERT INTO dbo.memories (scope, subject, kind, title, body, tags, source_session, confidence)
+INSERT INTO dbo.memories (scope, subject, kind, title, body, tags, source_session, confidence, valence, context)
 OUTPUT INSERTED.id AS id, LEN(INSERTED.title) AS tlen, LEN(INSERTED.body) AS blen
-VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf)
+VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf, CASE WHEN @valence = -1 THEN NULL ELSE @valence END, NULLIF(@context, ''))
 "@ -Params $saveParams
     }
     if (@($res).Count -ne 1) { throw "save wrote no row (INSERT returned nothing)" }
@@ -1628,10 +1694,32 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf)
 
   'search' {
     if (-not $Target) { throw "search requires a keyword" }
-    $q = '%' + $Target + '%'
+    # 多词按 AND 拆开（原来 "共享盘 SMB" 整串一个 LIKE，零命中）；LIKE 通配符转义
+    $terms = @($Target -split '\s+' | Where-Object { $_ })
+    if ($terms.Count -eq 0) { $terms = @($Target) }
+    $likeParams = @{ '@n' = $Limit }
+    $likeClauses = @()
+    for ($ti = 0; $ti -lt $terms.Count; $ti++) {
+      $esc = $terms[$ti] -replace '\[', '[[]' -replace '%', '[%]' -replace '_', '[_]'
+      $likeParams['@q' + $ti] = '%' + $esc + '%'
+      $likeClauses += ('(title LIKE @q' + $ti + ' OR body LIKE @q' + $ti + ' OR tags LIKE @q' + $ti + ')')
+    }
+    $whereLike = ($likeClauses -join ' AND ')
     if (Test-DbAlive) {
       Write-Host ("== memories matching '$Target' ==")
-      $m = Invoke-Rows -Sql "SELECT TOP (@n) id, created_at, scope, subject, kind, title, tags, body FROM dbo.memories WHERE title LIKE @q OR body LIKE @q OR tags LIKE @q ORDER BY updated_at DESC" -Params @{ '@n' = $Limit; '@q' = $q }
+      # [ACCESS-REINFORCE-20261119] 排序加 access_count DESC（检索命中即"被想起"，常被想起的优先）
+      $sqlMem = "SELECT TOP (@n) id, created_at, scope, subject, kind, title, tags, body FROM dbo.memories WHERE $whereLike ORDER BY access_count DESC, CASE WHEN title LIKE @q0 THEN 0 ELSE 1 END, updated_at DESC"
+      $m = Invoke-Rows -Sql $sqlMem -Params $likeParams
+      # [FTS-SQLSERVER-20261123]/[FTS-MYSQL-20261123]/[FTS-SQLITE-20261123] memories 分支：
+      #   先 LIKE，LIKE 0 命中才回退 FTS（FREETEXTTABLE / MATCH / fts5，三方言见 Invoke-MemoryFts）。
+      if (@($m).Count -eq 0) {
+        $m = Invoke-MemoryFts -Target $Target -Limit $Limit
+      }
+      # [ACCESS-REINFORCE-20261119] 访问加固：对最终展示的记忆 +1、记访问时间（检索命中即"被想起"）
+      $arIds = @($m | ForEach-Object { [int64]$_.id })
+      if ($arIds.Count -gt 0) { $null = Invoke-Exec -Sql ("UPDATE dbo.memories SET access_count = access_count + 1, last_injected_at = SYSUTCDATETIME() WHERE id IN (" + ($arIds -join ',') + ")") }
+      # [CO-OCCUR-20261119] 共现互链：同一次查询同时命中的记忆，两两记一条共现边、weight+1
+      Invoke-CoOccur -HitIds $arIds
       if (@($m).Count -eq 0) { Write-Host "  (none)" }
       foreach ($r in @($m)) {
         Write-Host ("  [{0}] {1} {2}/{3} {4}  {5}" -f $r.id, $r.created_at.ToLocalTime().ToString('MM-dd HH:mm'), $r.scope, $r.subject, $r.kind, $r.title)
@@ -1652,9 +1740,32 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf)
       }
       Write-Host ""
       Write-Host ("== messages matching '$Target' ==")
-      $g = Invoke-Rows -Sql "SELECT TOP (@n) session_id, seq, role, created_at, LEFT(text, 200) AS snippet FROM dbo.messages WHERE text LIKE @q ORDER BY created_at DESC" -Params @{ '@n' = $Limit; '@q' = $q }
+      # [FTS-SQLSERVER-20261123]/[FTS-MYSQL-20261123]/[FTS-SQLITE-20261123] messages 两阶段：
+      #   先 FTS 取候选（上限 Max($Limit*4,40)），内存里对每个词做子串 AND 精确过滤，
+      #   候选为空才退回原 LIKE 全表（行为与 live 完全一致）。
+      $msgCand = @()
+      $g = @()
+      try {
+        $msgCandLimit = [int]([Math]::Max($Limit * 4, 40))
+        $msgCand = Invoke-MessageFtsCandidates -Target $Target -Limit $msgCandLimit
+        $msgKept = @()
+        foreach ($cr in @($msgCand)) {
+          $tx = [string]$cr.text
+          $hitAll = $true
+          foreach ($t in @($terms)) { if ($tx.IndexOf($t, [StringComparison]::OrdinalIgnoreCase) -lt 0) { $hitAll = $false; break } }
+          if (-not $hitAll) { continue }
+          $snip = $(if ($tx.Length -gt 200) { $tx.Substring(0, 200) } else { $tx })
+          $msgKept += [pscustomobject]@{ session_id = $cr.session_id; seq = $cr.seq; role = $cr.role; created_at = $cr.created_at; snippet = $snip }
+          if ($msgKept.Count -ge $Limit) { break }
+        }
+        $g = @($msgKept)
+      } catch { $msgCand = @(); $g = @() }
+      if (@($msgCand).Count -eq 0) {
+        $msgWhere = (@($terms | ForEach-Object -Begin { $i = 0 } -Process { $i++; '(text LIKE @q' + ($i - 1) + ')' }) -join ' AND ')
+        $g = Invoke-Rows -Sql "SELECT TOP (@n) session_id, seq, role, created_at, LEFT(text, 200) AS snippet FROM dbo.messages WHERE $msgWhere ORDER BY created_at DESC" -Params $likeParams
+      }
       if (@($g).Count -eq 0) { Write-Host "  (none)" }
-      foreach ($r in @($g)) { Write-Host ("  {0} #{1} {2}: {3}" -f $r.created_at.ToLocalTime().ToString('MM-dd HH:mm'), $r.seq, $r.role, ($r.snippet -replace '\s+', ' ')) }
+      foreach ($r in @($g)) { Write-Host ("  {0} #{1} {2}: {3}" -f $r.created_at.ToLocalTime().ToString('MM-dd HH:mm'), $r.seq, $r.role, ([string]$r.snippet -replace '\s+', ' ')) }
     } else {
       $rep = Get-Replica
       if (-not $rep) { Write-NoReplica; return }
@@ -2078,6 +2189,30 @@ WHERE e.model = @model AND r.rn > 1
     } else {
       Write-Host "  nothing to do: every candidate already has a vector with the same text_hash"
     }
+  }
+
+  'mood' {
+    # [MOOD-20261119] 情绪状态变量：读 4 个内部状态 + 按静默时间漂移。
+    # 漂移只对 boredom(+0.0002/min 上限 1.0) 与 energy(-0.0001/min 下限 0.1) 生效，其余保持原值。
+    # 时间差按方言显式写：DATEDIFF(MINUTE) / TIMESTAMPDIFF(MINUTE) / julianday 差值×1440。
+    if (Test-DbAlive) {
+      $minExpr = switch ($script:Provider) {
+        'mysql'  { 'TIMESTAMPDIFF(MINUTE, updated_at, UTC_TIMESTAMP(3))' }
+        'sqlite' { "(julianday('now') - julianday(updated_at)) * 1440.0" }
+        default  { 'DATEDIFF(MINUTE, updated_at, SYSUTCDATETIME())' }
+      }
+      $nowExpr = switch ($script:Provider) {
+        'mysql'  { 'UTC_TIMESTAMP(3)' }
+        'sqlite' { "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))" }
+        default  { 'SYSUTCDATETIME()' }
+      }
+      $tbl = if ($script:Provider -eq 'sqlserver') { 'dbo.agent_state' } else { 'agent_state' }
+      $driftSql = "UPDATE $tbl SET value = CASE state_name WHEN 'boredom' THEN CASE WHEN value + 0.0002 * $minExpr > 1.0 THEN 1.0 ELSE value + 0.0002 * $minExpr END WHEN 'energy' THEN CASE WHEN value - 0.0001 * $minExpr < 0.1 THEN 0.1 ELSE value - 0.0001 * $minExpr END ELSE value END, updated_at = $nowExpr"
+      $null = Invoke-Exec -Sql $driftSql
+      $st = Invoke-Rows -Sql ("SELECT state_name, value FROM " + $tbl + " ORDER BY state_name")
+      Write-Host "== 当前情绪状态 =="
+      foreach ($s in @($st)) { Write-Host ("  " + ([string]$s.state_name).PadRight(14) + " " + [Math]::Round([double]$s.value, 3)) }
+    } else { Write-NoReplica }
   }
 
   'recent' {
