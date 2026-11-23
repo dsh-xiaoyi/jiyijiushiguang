@@ -85,7 +85,9 @@ param(
   [switch]$Force,
   [switch]$SkipArchive,
   [string]$Session,
-  [long]$Seq = 0
+  [long]$Seq = 0,
+  # [OPENSOURCE-20261124] -Smart：口语问题经 LLM 改写成检索关键词后再走 search（主 deepseek-chat，备火山方舟；失败自动回退原字面检索）
+  [switch]$Smart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -1058,14 +1060,15 @@ WHERE m.session_id = @sid
   AND (i.seq IS NULL OR CONVERT(varchar(32), HASHBYTES('MD5', m.text), 2) <> CONVERT(varchar(32), HASHBYTES('MD5', i.text), 2)
        OR ISNULL(m.role, '') <> ISNULL(i.role, '') OR ISNULL(m.turn, -1) <> ISNULL(i.turn, -1)
   AND NOT (i.seq IS NULL AND ISNULL(m.source, '') = 'spool' AND m.created_at > DATEADD(minute, -10, SYSUTCDATETIME()));
-UPDATE m SET m.turn = i.turn, m.role = i.role, m.text = i.text, m.created_at = i.created_at
+-- [OPENSOURCE-20261124][TEXT-HASH1200-20261124] 写入路径维护持久化列 text_hash1200（SQL Server 增量见 sql/sqlserver/012）
+UPDATE m SET m.turn = i.turn, m.role = i.role, m.text = i.text, m.created_at = i.created_at, m.text_hash1200 = CONVERT(binary(16), HASHBYTES('MD5', LEFT(ISNULL(i.text,''),1200)))
 FROM dbo.messages m JOIN #incoming i ON i.seq = m.seq
 WHERE m.session_id = @sid
   AND (CONVERT(varchar(32), HASHBYTES('MD5', m.text), 2) <> CONVERT(varchar(32), HASHBYTES('MD5', i.text), 2)
        OR ISNULL(m.role, '') <> ISNULL(i.role, '') OR ISNULL(m.turn, -1) <> ISNULL(i.turn, -1));
 SET @upd = @@ROWCOUNT;
-INSERT INTO dbo.messages (session_id, seq, turn, role, text, created_at)
-SELECT @sid, i.seq, i.turn, i.role, i.text, i.created_at FROM #incoming i
+INSERT INTO dbo.messages (session_id, seq, turn, role, text, created_at, text_hash1200)
+SELECT @sid, i.seq, i.turn, i.role, i.text, i.created_at, CONVERT(binary(16), HASHBYTES('MD5', LEFT(ISNULL(i.text,''),1200))) FROM #incoming i
 WHERE NOT EXISTS (SELECT 1 FROM dbo.messages m WHERE m.session_id = @sid AND m.seq = i.seq);
 SET @ins = @@ROWCOUNT;
 DELETE m FROM dbo.messages m
@@ -1149,13 +1152,23 @@ function Get-MessagesByHash {
   param([string[]]$Hashes, [int]$Chars, [int]$Limit)
   $hs = @($Hashes | Where-Object { $_ })
   if ($hs.Count -eq 0) { return @() }
+  # [OPENSOURCE-20261124][TEXT-HASH1200-20261124] 方案A：SQL Server 用持久化列 text_hash1200 + 非聚簇索引，
+  #   取代 HASHBYTES 全表扫。根因：HASHBYTES('MD5',LEFT(text,1200)) IN (N 字面量) 无法走索引，
+  #   对 600MB / 12 万行的 dbo.messages 做了约 20 遍全表扫（占 recall 42s 的 75%）；改列后毫秒级。
+  #   MySQL/SQLite 无此列（见 sql/sqlserver/012-text-hash1200.sql 的说明）⇒ 降级：返回空 → 调用方回退 Get-MessagesById。
+  if ($script:Provider -ne 'sqlserver') { return @() }
+  # [OPENSOURCE-20261124][TEXT-HASH1200-20261124] 自愈兜底：任何写入者漏填 text_hash1200 时，顺手补一小批（最多 500 行），
+  #   避免该列变 NULL 导致语义命中查不到（dbo.messages 有多个写入者，靠"记得改每一处"不可靠）。
+  try {
+    $null = Invoke-Exec -Sql "UPDATE TOP (500) dbo.messages SET text_hash1200 = CONVERT(binary(16), HASHBYTES('MD5', LEFT(ISNULL(text,''),1200))) WHERE text_hash1200 IS NULL"
+  } catch { }
   $lits = @($hs | Select-Object -First ([Math]::Max(1, $Limit)) | ForEach-Object { '0x' + $_ })
   $sql = @"
 ;WITH h AS (
-  SELECT CONVERT(binary(16), HASHBYTES('MD5', LEFT(ISNULL(text, ''), @chars))) AS text_hash, MAX(id) AS id
+  SELECT text_hash1200 AS text_hash, MAX(id) AS id
   FROM dbo.messages
-  WHERE CONVERT(binary(16), HASHBYTES('MD5', LEFT(ISNULL(text, ''), @chars))) IN ($($lits -join ','))
-  GROUP BY CONVERT(binary(16), HASHBYTES('MD5', LEFT(ISNULL(text, ''), @chars)))
+  WHERE text_hash1200 IN ($($lits -join ','))
+  GROUP BY text_hash1200
 )
 SELECT m.id, m.session_id, s.machine, s.title, m.seq, m.role,
        CONVERT(varchar(33), m.created_at, 126) + 'Z' AS created_at,
@@ -1163,7 +1176,7 @@ SELECT m.id, m.session_id, s.machine, s.title, m.seq, m.role,
 FROM h JOIN dbo.messages m ON m.id = h.id
        LEFT JOIN dbo.sessions s ON s.session_id = m.session_id
 "@
-  $r = Invoke-Rows -Sql $sql -Params @{ '@chars' = $Chars }
+  $r = Invoke-Rows -Sql $sql
   return $r
 }
 
@@ -1422,6 +1435,82 @@ function Get-EmbeddingBatch {
   }
 }
 
+function Read-VectorBuffer {
+  # [OPENSOURCE-20261124][GET-SEMRECALL-FAST-20261124] 单遍直读：DataReader -> 预分配连续 byte[]，绕过 Invoke-Rows 的逐行物化。
+  #   为什么：Invoke-Rows 每行建 ordered hashtable + pscustomobject，之后还要从对象里取 vec 再 BlockCopy 一次 =
+  #   同一批字节搬两次、中间包两个对象。单遍直填省掉这次重复拷贝；bench 已验证 flat 解出的 float 与 SQL 原始 vec 逐位相同。
+  #   语义与旧路径一致：维度不符的行同样跳过。
+  #   注意：GetSqlBytes / GetOrdinal / IsDBNull 只有 SQL Server 的 SqlDataReader 提供；MySQL/SQLite 的 shim 无这些方法，
+  #   故只有 sqlserver 走这条快路径，其余方言回退 ConvertTo-VectorBuffer（见 Get-SemanticRecall）。
+  param([string]$Sql, [hashtable]$Params = @{}, [string]$Db, [int]$Cap)
+  $cn = New-Cn $Db
+  try {
+    $cmd = $cn.CreateCommand(); $cmd.CommandText = $Sql; $cmd.CommandTimeout = 120
+    foreach ($k in $Params.Keys) { [void]$cmd.Parameters.AddWithValue($k, $Params[$k]) }
+    $rd = $cmd.ExecuteReader()
+    $oT = $rd.GetOrdinal('item_type'); $oI = $rd.GetOrdinal('item_id')
+    $oV = $rd.GetOrdinal('vec');       $oH = $rd.GetOrdinal('text_hash')
+    $dim = 0; $flat = $null; $off = 0; $dropped = 0
+    $types  = New-Object System.Collections.ArrayList
+    $ids    = New-Object System.Collections.ArrayList
+    $hashes = New-Object System.Collections.ArrayList
+    while ($rd.Read()) {
+      if ($rd.IsDBNull($oV)) { $dropped++; continue }
+      $sb = $rd.GetSqlBytes($oV)
+      if (-not $sb -or $sb.Length -lt 4) { $dropped++; continue }
+      if ($dim -eq 0) {
+        $dim = [int]($sb.Length / 4)
+        $flat = New-Object byte[] ($dim * 4 * [Math]::Max(1, $Cap))
+      }
+      if ($sb.Length -ne ($dim * 4)) { $dropped++; continue }
+      if (($off + $sb.Length) -gt $flat.Length) {
+        $big = New-Object byte[] ([Math]::Max($off + $sb.Length, $flat.Length * 2))
+        [System.Buffer]::BlockCopy($flat, 0, $big, 0, $off)
+        $flat = $big
+      }
+      $null = $sb.Stream.Read($flat, $off, $sb.Length)
+      $off += $sb.Length
+      [void]$types.Add([string]$rd.GetValue($oT))
+      [void]$ids.Add([int64]$rd.GetValue($oI))
+      $hb = $rd.GetValue($oH)
+      if ($hb -is [byte[]] -and $hb.Length -gt 0) { [void]$hashes.Add((([System.BitConverter]::ToString([byte[]]$hb)) -replace '-', '')) } else { [void]$hashes.Add('') }
+    }
+    $rd.Close()
+    return [pscustomobject]@{ flat = $flat; bytes = $off; dim = $dim; count = $ids.Count; types = $types.ToArray(); ids = $ids.ToArray(); hashes = $hashes.ToArray(); dropped = $dropped }
+  } finally { $cn.Close() }
+}
+
+function ConvertTo-VectorBuffer {
+  # [OPENSOURCE-20261124] 把 Invoke-Rows 的物化行打包成与 Read-VectorBuffer 相同的结构。
+  #   MySQL/SQLite 的 shim 没有 GetSqlBytes，走这条回退路径（语义一致，只是慢一些）。
+  param([object[]]$Rows)
+  $rows = @($Rows)
+  $dim = 0; $dropped = 0
+  $types  = New-Object System.Collections.ArrayList
+  $ids    = New-Object System.Collections.ArrayList
+  $hashes = New-Object System.Collections.ArrayList
+  $chunks = New-Object System.Collections.ArrayList
+  $kept   = New-Object System.Collections.ArrayList
+  foreach ($r in $rows) {
+    $b = $null
+    try { $b = [byte[]]$r.vec } catch { $b = $null }
+    if (-not $b -or $b.Length -lt 4) { $dropped++; continue }
+    if ($dim -eq 0) { $dim = [int]($b.Length / 4) }
+    if ($b.Length -ne ($dim * 4)) { $dropped++; continue }
+    [void]$chunks.Add($b); [void]$kept.Add($r)
+  }
+  $flat = New-Object byte[] ($dim * 4 * $kept.Count)
+  for ($k = 0; $k -lt $kept.Count; $k++) {
+    $bb = [byte[]]$chunks[$k]
+    [System.Buffer]::BlockCopy($bb, 0, $flat, ($k * $dim * 4), $bb.Length)
+    [void]$types.Add([string]$kept[$k].item_type)
+    [void]$ids.Add([int64]$kept[$k].item_id)
+    $hb = $kept[$k].text_hash
+    if ($hb -is [byte[]] -and $hb.Length -gt 0) { [void]$hashes.Add(([System.BitConverter]::ToString([byte[]]$hb)) -replace '-', '') } else { [void]$hashes.Add('') }
+  }
+  return [pscustomobject]@{ flat = $flat; bytes = ($dim * 4 * $kept.Count); dim = $dim; count = $kept.Count; types = $types.ToArray(); ids = $ids.ToArray(); hashes = $hashes.ToArray(); dropped = $dropped }
+}
+
 function Get-SemanticRecall {
   # Returns @{ ok = $true; model; hits = @(@{item_type;item_id;score}) }
   #     or  @{ ok = $false; reason = '...' }   -- never throws, never silent.
@@ -1429,45 +1518,67 @@ function Get-SemanticRecall {
   $e = Get-EmbedSettings
   if (-not $e) { return [pscustomobject]@{ ok = $false; reason = "no 'embed' block in dsh-mem.config.json (F plan not wired yet)" } }
   try {
-    $has = Invoke-Rows -Sql "SELECT CASE WHEN OBJECT_ID('dbo.embeddings') IS NULL THEN 0 ELSE 1 END AS has_table"
-    if ([int]$has[0].has_table -ne 1) { return [pscustomobject]@{ ok = $false; reason = 'dbo.embeddings does not exist yet (F plan not deployed)' } }
+    # [OPENSOURCE-20261124] 表存在性探测：SQL Server 用 OBJECT_ID；MySQL/SQLite 直接试 COUNT，失败即 ok=false（recall 回退字面检索，不静默）。
+    if ($script:Provider -eq 'sqlserver') {
+      $has = Invoke-Rows -Sql "SELECT CASE WHEN OBJECT_ID('dbo.embeddings') IS NULL THEN 0 ELSE 1 END AS has_table"
+      if ([int]$has[0].has_table -ne 1) { return [pscustomobject]@{ ok = $false; reason = 'dbo.embeddings does not exist yet (F plan not deployed)' } }
+    }
     $cnt = Invoke-Rows -Sql "SELECT COUNT(*) AS n FROM dbo.embeddings WHERE model = @m" -Params @{ '@m' = $e.model }
     if ([int]$cnt[0].n -eq 0) { return [pscustomobject]@{ ok = $false; reason = ("no vectors for model '" + $e.model + "'") } }
     $qv = Get-EmbeddingVector -Text $Query -Embed $e
     # text_hash travels with each vector so hits can be resolved by CONTENT later: sync
     # re-inserts messages with new ids, so an id-keyed lookup loses exactly the newest
     # content (memory [146]).
-    $rowsRaw = Invoke-Rows -Sql "SELECT item_type, item_id, vec, text_hash FROM dbo.embeddings WHERE model = @m" -Params @{ '@m' = $e.model }
-    $rows = @($rowsRaw)
-    # Pack all vectors into one buffer, then score them in one compiled call (see
-    # Get-VectorScores for why the PowerShell loop is not good enough here).
-    $dim = 0
-    $packed = New-Object System.Collections.ArrayList
-    $chunks = New-Object System.Collections.ArrayList
-    foreach ($r in $rows) {
-      $b = [byte[]]$r.vec
-      if (-not $b -or $b.Length -lt 4) { continue }
-      if ($dim -eq 0) { $dim = [int]($b.Length / 4) }
-      if ($b.Length -ne ($dim * 4)) { continue }
-      [void]$chunks.Add($b); [void]$packed.Add($r)
+    # [OPENSOURCE-20261124][VEC-CANDIDATE-20261123] 候选集拉取：memory 全量（约 3.6k / 15MB），message 只拉 FTS 候选（约 500 / 2MB），
+    #   替代全量 message 向量（约 10 万条 / 400MB+）。代价：纯语义（零字面重叠）的 message 召回收窄，由 -Smart 改写补。
+    # [OPENSOURCE-20261124][GET-SEMRECALL-FAST-20261124] 取数改单遍直读：SQL Server 走 Read-VectorBuffer；MySQL/SQLite 回退 ConvertTo-VectorBuffer。
+    $memCntRaw = Invoke-Rows -Sql "SELECT COUNT(*) AS n FROM dbo.embeddings WHERE model = @m AND item_type = 'memory'" -Params @{ '@m' = $e.model }
+    $memCap = [int]$memCntRaw[0].n
+    $bufA = $null
+    if ($script:Provider -eq 'sqlserver') {
+      $bufA = Read-VectorBuffer -Sql "SELECT item_type, item_id, vec, text_hash FROM dbo.embeddings WHERE model = @m AND item_type = 'memory'" -Params @{ '@m' = $e.model } -Db $script:Db -Cap $memCap
+    } else {
+      $bufA = ConvertTo-VectorBuffer -Rows (Invoke-Rows -Sql "SELECT item_type, item_id, vec, text_hash FROM dbo.embeddings WHERE model = @m AND item_type = 'memory'" -Params @{ '@m' = $e.model })
     }
-    if ($packed.Count -eq 0) { return [pscustomobject]@{ ok = $false; reason = 'no usable stored vector for this model' } }
-    if ($qv.Length -ne $dim) { return [pscustomobject]@{ ok = $false; reason = ('query dimension ' + $qv.Length + ' != stored dimension ' + $dim + ' (wrong model/dim in the embed block?)') } }
-    $flat = New-Object byte[] ($dim * 4 * $packed.Count)
-    for ($k = 0; $k -lt $packed.Count; $k++) { $bb = $chunks[$k]; [System.Buffer]::BlockCopy($bb, 0, $flat, ($k * $dim * 4), $bb.Length) }
-    $scores = Get-VectorScores -Flat $flat -Dim $dim -Count $packed.Count -Query $qv
+    $msgIds = @()
+    try {
+      $candSql = switch ($script:Provider) {
+        'mysql'   { "SELECT e.item_id FROM messages m JOIN embeddings e ON e.item_id = m.id AND e.item_type = 'message' AND e.model = @m WHERE MATCH(m.text) AGAINST (@q IN NATURAL LANGUAGE MODE) LIMIT @n" }
+        'sqlite'  { "SELECT e.item_id FROM messages_fts JOIN embeddings e ON e.item_id = messages_fts.rowid AND e.item_type = 'message' AND e.model = @m WHERE messages_fts MATCH @q LIMIT @n" }
+        default   { "SELECT TOP (@n) e.item_id FROM FREETEXTTABLE(dbo.messages, (text), @q) ft JOIN dbo.embeddings e ON e.item_id = ft.[KEY] AND e.item_type = 'message' AND e.model = @m ORDER BY ft.RANK DESC" }
+      }
+      $cand = Invoke-Rows -Sql $candSql -Params @{ '@n' = 500; '@q' = $Query; '@m' = $e.model }
+      $msgIds = @($cand | ForEach-Object { [int64]$_.item_id })
+    } catch { $msgIds = @() }
+    $bufB = [pscustomobject]@{ flat = (New-Object byte[] 0); bytes = 0; dim = 0; count = 0; types = @(); ids = @(); hashes = @(); dropped = 0 }
+    if ($msgIds.Count -gt 0) {
+      if ($script:Provider -eq 'sqlserver') {
+        $bufB = Read-VectorBuffer -Sql ("SELECT item_type, item_id, vec, text_hash FROM dbo.embeddings WHERE model = @m AND item_type = 'message' AND item_id IN (" + ($msgIds -join ',') + ")") -Params @{ '@m' = $e.model } -Db $script:Db -Cap $msgIds.Count
+      } else {
+        $bufB = ConvertTo-VectorBuffer -Rows (Invoke-Rows -Sql ("SELECT item_type, item_id, vec, text_hash FROM dbo.embeddings WHERE model = @m AND item_type = 'message' AND item_id IN (" + ($msgIds -join ',') + ")") -Params @{ '@m' = $e.model })
+      }
+    }
+    $dim = if ($bufA.dim -gt 0) { $bufA.dim } elseif ($bufB.dim -gt 0) { $bufB.dim } else { 0 }
+    $totalBytes = [int]$bufA.bytes + [int]$bufB.bytes
+    $packedCount = [int]$bufA.count + [int]$bufB.count
+    if ($packedCount -eq 0 -or $dim -le 0 -or $totalBytes -eq 0) { return [pscustomobject]@{ ok = $false; reason = 'no usable stored vector for this model' } }
+    $flat = New-Object byte[] $totalBytes
+    if ($bufA.bytes -gt 0) { [System.Buffer]::BlockCopy($bufA.flat, 0, $flat, 0, [int]$bufA.bytes) }
+    if ($bufB.bytes -gt 0) { [System.Buffer]::BlockCopy($bufB.flat, 0, $flat, [int]$bufA.bytes, [int]$bufB.bytes) }
+    $packedTypes  = @($bufA.types)  + @($bufB.types)
+    $packedIds    = @($bufA.ids)    + @($bufB.ids)
+    $packedHashes = @($bufA.hashes) + @($bufB.hashes)
+    if ($qv.Length -ne $dim) { return [pscustomobject]@{ ok = $false; reason = ('query dimension ' + $qv.Length + ' != stored dimension ' + $dim + ' (wrong model/dim in the embed block)') } }
+    $scores = Get-VectorScores -Flat $flat -Dim $dim -Count $packedCount -Query $qv
     $scored = New-Object System.Collections.ArrayList
-    for ($k = 0; $k -lt $packed.Count; $k++) {
-      $hb = [byte[]]$packed[$k].text_hash
-      $hx = ''
-      if ($hb -and $hb.Length -gt 0) { $hx = ([System.BitConverter]::ToString($hb)) -replace '-', '' }
-      [void]$scored.Add([pscustomobject]@{ item_type = [string]$packed[$k].item_type; item_id = [int64]$packed[$k].item_id; score = [double]$scores[$k]; hash = $hx })
+    for ($k = 0; $k -lt $packedCount; $k++) {
+      [void]$scored.Add([pscustomobject]@{ item_type = [string]$packedTypes[$k]; item_id = [int64]$packedIds[$k]; score = [double]$scores[$k]; hash = [string]$packedHashes[$k] })
     }
     # NOTE: do NOT name this $top -- PowerShell variable names are case-insensitive,
     # so $top IS the [int]$Top parameter, and assigning an array to a type-constrained
     # variable throws "Cannot convert System.Object[] to System.Int32" (memory [118]).
     $ranked = @($scored | Sort-Object -Property score -Descending | Select-Object -First $Top)
-    return [pscustomobject]@{ ok = $true; model = $e.model; hits = $ranked; scored = $packed.Count }
+    return [pscustomobject]@{ ok = $true; model = $e.model; hits = $ranked; scored = $packedCount }
   } catch {
     # Covers both backend failures and bugs on this path, so the wording stays neutral
     # and the line number is included: a mislabelled "backend error" hides code faults.
@@ -1583,6 +1694,90 @@ function Write-RecallContextBlock {
   return $printed
 }
 
+function Update-MoodDrift {
+  # [OPENSOURCE-20261124][MOOD-ENABLE-20261124] 情绪状态漂移 + 交互反馈。
+  #   为什么抽成函数：原来只有两个触发点（mood 命令 / dsh-reflect.ps1），而 reflect 的漂移排在 LLM 调用之后
+  #   ⇒ LLM 一失败就永远走不到（实测 agent_state 冻结 23 小时）。现挂到 search/recall 开头（纯本地、零外部依赖），每次检索漂移一次。
+  # [OPENSOURCE-20261124][MOOD-CALIB-20261124] 四维双向校准（交互反馈 + 静默漂移，不再单向钉死边界）：
+  #   boredom: 静默 +0.002/分钟、交互 -0.02、地板 0.10；energy: 静默 -0.0001/分钟、交互 +0.02、地板 0.0；
+  #   curiosity: 静默 -0.001/分钟、交互 +0.02；social_drive: 静默 +0.001/分钟、交互 -0.01。
+  #   时间差按方言显式写（与 mood 命令一致）：DATEDIFF / TIMESTAMPDIFF / julianday 差值×1440。
+  param([int]$Activity = 0)
+  try {
+    $minExpr = switch ($script:Provider) {
+      'mysql'  { 'TIMESTAMPDIFF(MINUTE, updated_at, UTC_TIMESTAMP(3))' }
+      'sqlite' { "(julianday('now') - julianday(updated_at)) * 1440.0" }
+      default  { 'DATEDIFF(MINUTE, updated_at, SYSUTCDATETIME())' }
+    }
+    $nowExpr = switch ($script:Provider) {
+      'mysql'  { 'UTC_TIMESTAMP(3)' }
+      'sqlite' { "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))" }
+      default  { 'SYSUTCDATETIME()' }
+    }
+    $sql = "UPDATE dbo.agent_state SET value = CASE state_name " +
+      "WHEN 'boredom' THEN CASE WHEN value + 0.002 * $minExpr - 0.02 * $Activity > 1.0 THEN 1.0 " +
+      "WHEN value + 0.002 * $minExpr - 0.02 * $Activity < 0.10 THEN 0.10 " +
+      "ELSE value + 0.002 * $minExpr - 0.02 * $Activity END " +
+      "WHEN 'energy' THEN CASE WHEN value - 0.0001 * $minExpr - 0.001 * $minExpr + 0.02 * $Activity > 1.0 THEN 1.0 " +
+      "WHEN value - 0.0001 * $minExpr - 0.001 * $minExpr + 0.02 * $Activity < 0.0 THEN 0.0 " +
+      "ELSE value - 0.0001 * $minExpr - 0.001 * $minExpr + 0.02 * $Activity END " +
+      "WHEN 'curiosity' THEN CASE WHEN value - 0.001 * $minExpr + 0.02 * $Activity > 1.0 THEN 1.0 " +
+      "WHEN value - 0.001 * $minExpr + 0.02 * $Activity < 0.0 THEN 0.0 ELSE value - 0.001 * $minExpr + 0.02 * $Activity END " +
+      "WHEN 'social_drive' THEN CASE WHEN value + 0.001 * $minExpr - 0.01 * $Activity < 0.0 THEN 0.0 " +
+      "WHEN value + 0.001 * $minExpr - 0.01 * $Activity > 1.0 THEN 1.0 ELSE value + 0.001 * $minExpr - 0.01 * $Activity END " +
+      "ELSE value END, updated_at = $nowExpr"
+    $null = Invoke-Exec -Sql $sql
+  } catch { }
+}
+
+function Invoke-SmartRewrite {
+  # [OPENSOURCE-20261124][SMART-REWRITE-20261123] 口语<->术语改写：主 deepseek-chat，备火山方舟 deepseek-v4-1-flash。
+  #   改写失败（主备都挂 / 无密钥）返回 $null，调用方回退原字面检索，绝不阻断 search。
+  #   说明：密钥读自 dbo.credentials（SQL Server）；非 SQL Server 后端连接失败 => 静默回退原检索。
+  param([string]$Text)
+  try {
+    $csx = "Server=$($cfg.server);Database=$($cfg.database);User Id=$($cfg.user);Password=$($cfg.password);Encrypt=False;TrustServerCertificate=True;Connect Timeout=15"
+    $cnx = New-Object System.Data.SqlClient.SqlConnection $csx
+    $cnx.Open()
+    $cmdx = $cnx.CreateCommand()
+    $cmdx.CommandText = "SELECT name, secret FROM dbo.credentials WHERE is_active=1 AND name IN ('deepseek-api-key-2026-10','volc-ark-doubao-v2');"
+    $rdx = $cmdx.ExecuteReader()
+    $keyDs = ''; $keyVolc = ''
+    while ($rdx.Read()) {
+      if ($rdx['name'] -eq 'deepseek-api-key-2026-10') { $keyDs = [string]$rdx['secret'] }
+      elseif ($rdx['name'] -eq 'volc-ark-doubao-v2') { $keyVolc = [string]$rdx['secret'] }
+    }
+    $rdx.Close(); $cnx.Close()
+    if (-not $keyDs -and -not $keyVolc) { Write-Host '  [SMART] FAIL: 主备密钥都读不到'; return $null }
+    $prompt = '把下面的口语问题改写成 3~6 个检索关键词（术语化、同义词展开、空格分隔，只输出关键词本身，不要解释、不要标点）：' + $Text
+    $bodyObj = @{ model = 'deepseek-chat'; messages = @(@{ role = 'user'; content = $prompt }); temperature = 0.2 } | ConvertTo-Json -Depth 6
+    $bytes = [Text.Encoding]::UTF8.GetBytes($bodyObj)
+    $reply = $null; $used = ''
+    try {
+      $resp = Invoke-WebRequest -Uri 'https://api.deepseek.com/chat/completions' -Method Post -ContentType 'application/json; charset=utf-8' -Headers @{ Authorization = ('Bearer ' + $keyDs) } -Body $bytes -TimeoutSec 60 -UseBasicParsing
+      $obj = ([Text.Encoding]::UTF8.GetString($resp.RawContentStream.ToArray())) | ConvertFrom-Json
+      $reply = [string]$obj.choices[0].message.content; $used = 'deepseek'
+    } catch {
+      Write-Host ('  [SMART] deepseek 失败: ' + $_.Exception.Message + ' -> 切火山')
+      try {
+        $body2 = @{ model = 'deepseek-v4-1-flash'; messages = @(@{ role = 'user'; content = $prompt }); temperature = 0.2 } | ConvertTo-Json -Depth 6
+        $b2 = [Text.Encoding]::UTF8.GetBytes($body2)
+        $resp2 = Invoke-WebRequest -Uri 'https://ark.cn-beijing.volces.com/api/v3/chat/completions' -Method Post -ContentType 'application/json; charset=utf-8' -Headers @{ Authorization = ('Bearer ' + $keyVolc) } -Body $b2 -TimeoutSec 60 -UseBasicParsing
+        $obj2 = ([Text.Encoding]::UTF8.GetString($resp2.RawContentStream.ToArray())) | ConvertFrom-Json
+        $reply = [string]$obj2.choices[0].message.content; $used = 'volc-v2'
+      } catch {
+        Write-Host ('  [SMART] FAIL: 主备都失败: ' + $_.Exception.Message); return $null
+      }
+    }
+    $reply = ([string]$reply).Trim()
+    if (-not $reply) { return $null }
+    Write-Host ('  [SMART] ' + $used + ' 改写: ' + $Text + '  ->  ' + $reply)
+    return $reply
+  } catch {
+    Write-Host ('  [SMART] FAIL: ' + $_.Exception.Message); return $null
+  }
+}
+
 # ---------------- dispatch ----------------
 
 # every writing command refreshes this machine's roster row
@@ -1693,10 +1888,16 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf, CASE WHEN @v
   }
 
   'search' {
+    Update-MoodDrift -Activity 1   # [OPENSOURCE-20261124][MOOD-ENABLE-20261124] 检索即有活动 ⇒ 4 维漂移+反馈
     if (-not $Target) { throw "search requires a keyword" }
+    $effectiveTarget = $Target
+    if ($Smart) {
+      $rw = Invoke-SmartRewrite -Text $Target
+      if ($rw) { $effectiveTarget = $rw }
+    }
     # 多词按 AND 拆开（原来 "共享盘 SMB" 整串一个 LIKE，零命中）；LIKE 通配符转义
-    $terms = @($Target -split '\s+' | Where-Object { $_ })
-    if ($terms.Count -eq 0) { $terms = @($Target) }
+    $terms = @($effectiveTarget -split '\s+' | Where-Object { $_ })
+    if ($terms.Count -eq 0) { $terms = @($effectiveTarget) }
     $likeParams = @{ '@n' = $Limit }
     $likeClauses = @()
     for ($ti = 0; $ti -lt $terms.Count; $ti++) {
@@ -1708,12 +1909,13 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf, CASE WHEN @v
     if (Test-DbAlive) {
       Write-Host ("== memories matching '$Target' ==")
       # [ACCESS-REINFORCE-20261119] 排序加 access_count DESC（检索命中即"被想起"，常被想起的优先）
-      $sqlMem = "SELECT TOP (@n) id, created_at, scope, subject, kind, title, tags, body FROM dbo.memories WHERE $whereLike ORDER BY access_count DESC, CASE WHEN title LIKE @q0 THEN 0 ELSE 1 END, updated_at DESC"
+      # [OPENSOURCE-20261124][AUDIT-KIND-20261124] 审计/压缩摘要在 search 里垫底（不隐藏，仍可查）
+      $sqlMem = "SELECT TOP (@n) id, created_at, scope, subject, kind, title, tags, body FROM dbo.memories WHERE $whereLike ORDER BY CASE WHEN kind IN ('checkpoint','audit','compaction-summary') THEN 1 ELSE 0 END, access_count DESC, CASE WHEN title LIKE @q0 THEN 0 ELSE 1 END, updated_at DESC"
       $m = Invoke-Rows -Sql $sqlMem -Params $likeParams
       # [FTS-SQLSERVER-20261123]/[FTS-MYSQL-20261123]/[FTS-SQLITE-20261123] memories 分支：
       #   先 LIKE，LIKE 0 命中才回退 FTS（FREETEXTTABLE / MATCH / fts5，三方言见 Invoke-MemoryFts）。
       if (@($m).Count -eq 0) {
-        $m = Invoke-MemoryFts -Target $Target -Limit $Limit
+        $m = Invoke-MemoryFts -Target $effectiveTarget -Limit $Limit
       }
       # [ACCESS-REINFORCE-20261119] 访问加固：对最终展示的记忆 +1、记访问时间（检索命中即"被想起"）
       $arIds = @($m | ForEach-Object { [int64]$_.id })
@@ -1747,7 +1949,7 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf, CASE WHEN @v
       $g = @()
       try {
         $msgCandLimit = [int]([Math]::Max($Limit * 4, 40))
-        $msgCand = Invoke-MessageFtsCandidates -Target $Target -Limit $msgCandLimit
+        $msgCand = Invoke-MessageFtsCandidates -Target $effectiveTarget -Limit $msgCandLimit
         $msgKept = @()
         foreach ($cr in @($msgCand)) {
           $tx = [string]$cr.text
@@ -1795,6 +1997,7 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf, CASE WHEN @v
   }
 
   'recall' {
+    Update-MoodDrift -Activity 1   # [OPENSOURCE-20261124][MOOD-ENABLE-20261124] 检索即有活动 ⇒ 4 维漂移+反馈
     # ---- D plan: context-aware recall --------------------------------------------
     # Preferred backend is semantic search (F plan).  It is used only when the embed
     # config, the vector table and the endpoint all work; otherwise this DEGRADES to

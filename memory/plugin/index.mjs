@@ -178,10 +178,11 @@ export function apply(ctx, config) {
   const injectLogPath = config.injectLogPath || 'C:\\dsh-mem\\logs\\inject.log'
   // T17-B: core rules from dbo.guard_rules (tier='core' AND prompt_text NOT NULL)
   const coreRulesPath = config.coreRulesPath || 'C:\\dsh-mem\\ops\\mem-core-rules.ps1'
-  // 2026-10-24 C4：混合检索（本地嵌入 bge-m3 via 18 的 Ollama；失败自动退化为纯 IDF）
+  // 2026-10-24 C4：混合检索（本地嵌入 bge-m3 via 模型机的 Ollama；失败自动退化为纯 IDF）
   const semanticOn    = config.semantic === false ? false : true
   const vectorPath    = config.vectorPath || 'C:\\dsh-mem\\mem-vectors.bin'
-  const ollamaUrl     = config.ollamaUrl || 'http://127.0.0.1:11434'
+  // [OPENSOURCE-20261124][HYBRID-RECALL-20261123] ollama 优先取 config.embed.baseURL，向量分支才会连到模型机（否则默认 127.0.0.1 本机回环 ⇒ 向量分支永不生效、退化成纯 IDF）
+  const ollamaUrl     = config.ollamaUrl || (config.embed && config.embed.baseURL) || 'http://127.0.0.1:11434'
   const embedModel    = config.embedModel || 'bge-m3'
   // 2026-10-25 r8（18 指出）：`injector=0.5.0` 从 r1 到 r7 一直没变 ⇒ **不携带"哪个 build"的信息**。
   //   改为 injector=0.5.0-<本文件 sha16 前 8 位>，自证 build；任何探针必须能区分相邻版本。
@@ -522,7 +523,12 @@ export function apply(ctx, config) {
           const kwList = Array.from(kws)
           if (kwList.length) {
             const pool = mems.filter(function (m) {
-              if (String(m.kind || '') === 'checkpoint' || String(m.kind || '') === 'evidence' || String(m.kind || '') === 'llm-call') return false
+              // [OPENSOURCE-20261124][AUDIT-KIND-20261124] 审计条目（MEM-FIRST-VIOLATION）与会话压缩摘要不参与自动召回：
+              //   它们数量大、title 几乎模板填空 ⇒ 对任何通用词都能排进 top，污染注入头相关记忆。
+              //   kind 是主判据；title 前缀是兜底（防止生产者漏改把 kind 写回 ops-note）。
+              const __kind = String(m.kind || '')
+              if (__kind === 'checkpoint' || __kind === 'evidence' || __kind === 'llm-call' || __kind === 'audit' || __kind === 'compaction-summary') return false
+              if (/^MEM-FIRST-VIOLATION\s/.test(String(m.title || ''))) return false
               if (String(m.status || 'current') === 'retired' || String(m.status || 'current') === 'archived') return false
               if (String(m.body || '').length > 200000) return false // 2026-10-24: 原来 >6000 直接跳过=静默丢失；只挡 20 万字符以上的极端情况
               return true
