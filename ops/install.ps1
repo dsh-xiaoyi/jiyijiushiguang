@@ -1,4 +1,5 @@
-﻿# 第一次用？先看 README 的「5 分钟跑起来」，再回来读这个脚本。
+﻿# [DIVERGENT-SOURCES-20261124] 本文件为三方言版（SQL Server / MySQL / SQLite）；与本仓 memory/plugin 配套；与 dsh-multi-agent-cluster 仓的同名文件不同源，不可互相覆盖。
+# 第一次用？先看 README 的「5 分钟跑起来」，再回来读这个脚本。
 # install.ps1 - 一键安装（单机最小闭环）· 支持 sqlserver / mysql / sqlite
 #
 # 只做"能把记忆跑起来"的最小动作，不修改系统安全设置、不安装第三方杀软、不联网下载。
