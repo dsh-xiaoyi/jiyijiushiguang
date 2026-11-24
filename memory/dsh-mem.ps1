@@ -182,7 +182,17 @@ Add-Type -AssemblyName System.Data
 
 $script:Db          = $cfg.database
 $script:CsBase      = "Server=$($cfg.server);User Id=$($cfg.user);Password=$($cfg.password);TrustServerCertificate=True;Connect Timeout=20"
-$script:StatePath   = Join-Path $Root 'dsh-mem-state.json'
+# [STATE-PERDB-20261124] 断点按后端/库隔离：换库（SQL Server→MySQL→SQLite）时新库不再被当成"全部已同步"
+#   原实现：所有后端共用 memory\dsh-mem-state.json ⇒ 同步过 A 库后，切到 B 库会被全部 skip(unchanged)
+$stateTag = 'default'
+try {
+  if ($cfg.provider -eq 'sqlite') {
+    $stateTag = 'sqlite-' + [System.IO.Path]::GetFileNameWithoutExtension([string]$cfg.sqliteDb)
+  } elseif ($cfg.provider -in @('mysql','sqlserver')) {
+    $stateTag = [string]$cfg.provider + '-' + ([string]$cfg.server -replace '[^A-Za-z0-9\.\-]','_') + '-' + [string]$cfg.database
+  }
+} catch { }
+$script:StatePath   = Join-Path $Root ('dsh-mem-state.' + $stateTag + '.json')
 # 副本路径：配置里写了就用配置的（文档承诺过），否则默认放在脚本旁边
 $script:ReplicaPath = if ($cfg.replicaPath) { [string]$cfg.replicaPath } else { Join-Path (Split-Path -Parent $CfgPath) 'dsh-mem-replica.json' }
 $script:ReplicaError = ''
@@ -203,6 +213,9 @@ function ConvertTo-MySqlLiteral {
   if ($Value -is [datetime]) { return ("'" + $Value.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss.fff') + "'") }
   $t = [string]$Value
   $t = $t.Replace('\', '\\').Replace("'", "''")
+  # [NUL-ESCAPE-20261124] 会话正文可能含 NUL(0x00):mysql.exe 直接拒绝 "ASCII '\0' appeared in the statement"
+  #   必须在反斜杠加倍之后替换,否则我们插入的 \0 会被再翻倍成字面量
+  $t = $t.Replace([string][char]0, '\0')
   return ("'" + $t + "'")
 }
 
@@ -282,7 +295,10 @@ function Invoke-MySqlCli {
   param([string]$Sql, [string]$Db)
   if (-not $Db) { $Db = $script:Db }
   # SET time_zone='+00:00' —— 用 [char]39 拼，避免多层引号嵌套
-  $tzInit = '--init-command=SET time_zone=' + [char]39 + '+00:00' + [char]39
+  # [COLLATION-20261124] 只给 --default-character-set 不够：连接排序规则会落到 MySQL8 默认
+  #   utf8mb4_0900_ai_ci，与建表用的 utf8mb4_general_ci 比较时报 1267 Illegal mix of collations
+  #   ⇒ 必须同一条 init-command 里显式 SET NAMES utf8mb4 COLLATE utf8mb4_general_ci
+  $tzInit = '--init-command=SET time_zone=' + [char]39 + '+00:00' + [char]39 + '; SET NAMES utf8mb4 COLLATE utf8mb4_general_ci'
   $cnf = [System.IO.Path]::GetTempFileName()
   try {
     $lines = @('[client]',
@@ -314,7 +330,8 @@ function Invoke-MySqlScript {
   param([string]$Sql, [string]$Db)
   if (-not $Db) { $Db = $script:Db }
   # 经 cmd.exe 传递时必须整体加双引号，否则空格会把参数切成两半（实测：mysql 直接打印 usage）
-  $tzInit = '--init-command=' + [char]34 + 'SET time_zone=' + [char]39 + '+00:00' + [char]39 + [char]34
+  # [COLLATION-20261124] 同上：SET NAMES ... COLLATE 必须一起走，否则 1267
+  $tzInit = '--init-command=' + [char]34 + 'SET time_zone=' + [char]39 + '+00:00' + [char]39 + '; SET NAMES utf8mb4 COLLATE utf8mb4_general_ci' + [char]34
   $cnf = [System.IO.Path]::GetTempFileName()
   $sqlf = [System.IO.Path]::GetTempFileName()
   try {
@@ -423,6 +440,12 @@ function ConvertTo-SqliteLiteral {
   if ($Value -is [datetime]) { return ("'" + $Value.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fff") + "Z'") }
   $t = [string]$Value
   $t = $t.Replace("'", "''")
+  # [SQLITE-NUL-ESCAPE-20261124] 会话正文可能含 NUL(0x00) 或其它 C0 控制字符：
+  #   sqlite3 的 SQL 文本里 NUL 会被当输入终止/非法 token ⇒ 整条 INSERT 崩
+  #   （实测报 "all VALUES must have the same number of terms" / "unrecognized token"）
+  #   SQLite 的字面量无法承载 NUL，只能剔除；制表/换行保留，其余 C0 替换为空格
+  if ($t.IndexOf([char]0) -ge 0) { $t = $t.Replace([string][char]0, '') }
+  $t = [regex]::Replace($t, '[\x01-\x08\x0B\x0C\x0E-\x1F]', ' ')
   return ("'" + $t + "'")
 }
 
@@ -478,7 +501,10 @@ function Invoke-SqliteCli {
   $f = [System.IO.Path]::GetTempFileName() + '.sql'
   try {
     [System.IO.File]::WriteAllText($f, $Sql, (New-Object System.Text.UTF8Encoding $false))
-    $out = & cmd.exe /c ('"' + $script:SqliteCliPath + '" -bail -batch "' + $script:SqliteDb + '" < "' + $f + '" 2>&1')
+    # [SQLITE-BUSY-TIMEOUT-20261124] sqlite3 默认 busy timeout=0：只要有第二个写者（第二个 sync、
+    #   本机 replica 任务、或上一轮残留进程）就立刻 "database is locked"，整会话被放弃（静默丢数据）
+    #   ⇒ 显式给 5 秒等锁；仍失败才报错
+    $out = & cmd.exe /c ('"' + $script:SqliteCliPath + '" -bail -batch -cmd ".timeout 5000" "' + $script:SqliteDb + '" < "' + $f + '" 2>&1')
     if ($LASTEXITCODE -ne 0) {
       $msg = (@($out) | Where-Object { $_ }) -join ' | '
       throw ('sqlite error ' + $LASTEXITCODE + ': ' + $msg)
@@ -812,6 +838,14 @@ function Invoke-Sync {
   if (-not (Test-Path -LiteralPath $cfg.node))      { throw "node not found: $($cfg.node)" }
   if (-not (Test-Path -LiteralPath $cfg.extractor)) { throw "extractor not found: $($cfg.extractor)" }
 
+  # [TEMP-CLEANUP-20261124] 进程被强杀/超时时 finally 不执行 ⇒ 临时 JSONL 残留
+  #   实测：多轮被杀的 sync 累积 12 个 / 614 MB。每次 sync 开头清掉 1 小时前的残留（不动本轮的）
+  try {
+    Get-ChildItem $env:TEMP -Filter 'dsh_sess_*.jsonl' -File -ErrorAction SilentlyContinue |
+      Where-Object { ((Get-Date) - $_.LastWriteTime).TotalHours -gt 1 } |
+      Remove-Item -Force -ErrorAction SilentlyContinue
+  } catch { }
+
   # --- skip unchanged session logs: makes a 1-2 minute schedule nearly free ---
   $fi  = Get-Item -LiteralPath $SessionFile -ErrorAction SilentlyContinue
   $key = "$($fi.Length):$($fi.LastWriteTimeUtc.Ticks)"
@@ -981,6 +1015,10 @@ ON DUPLICATE KEY UPDATE machine = VALUES(machine), cwd = VALUES(cwd), title = VA
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('BEGIN;')
     [void]$sb.AppendLine('CREATE TEMP TABLE _incoming (seq INTEGER NOT NULL, turn INTEGER, role TEXT NOT NULL, text TEXT, created_at TEXT NOT NULL);')
+    # [SQLITE-TEMP-INDEX-20261124] 临时表必须建 seq 索引：
+    #   后面的 LEFT JOIN / NOT IN 都按 seq 关联，无索引时退化成 O(rows × incoming)，
+    #   实测一个 3,703 行的会话在 sqlite3 里烧 158s CPU 并长期占写锁 ⇒ 后续会话全部 database is locked
+    [void]$sb.AppendLine('CREATE INDEX _incoming_seq ON _incoming(seq);')
     $batch = New-Object System.Collections.Generic.List[string]
     foreach ($row in $dt.Rows) {
       $turnLit = 'NULL'

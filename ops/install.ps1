@@ -37,7 +37,10 @@ param(
 $ErrorActionPreference = 'Stop'
 function Say($m) { Write-Host ('[' + (Get-Date -Format 'HH:mm:ss') + '] ' + $m) }
 
-if (-not $SessionsRoot) { $SessionsRoot = Join-Path $env:USERPROFILE '.dsh\sessions' }
+if (-not $SessionsRoot) {
+    # [DSHHOME-20261124] DSH_HOME 自定义时（如 D:\dsh-home），store 不在 %USERPROFILE%\.dsh
+    $SessionsRoot = if ($env:DSH_HOME) { Join-Path $env:DSH_HOME 'sessions' } else { Join-Path $env:USERPROFILE '.dsh\sessions' }
+}
 $repoRoot = Split-Path $PSScriptRoot -Parent
 
 function Test-Prerequisites {
@@ -255,4 +258,7 @@ if ($RegisterTasks) {
 } else { Say '4.5/5 跳过计划任务（-RegisterTasks 可自动注册；不注册时插件会在副本过期时自动刷新）' }
 
 Say '5/5 体检'
-& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'doctor.ps1') -ConfigPath $ConfigPath
+# [SKIP-NOT-FAIL-20261124] 主动跳过插件/副本时，体检按 SKIP 记，不判 FAIL
+$doctorExtra = ''
+if ($SkipPlugin -or $SkipReplica) { $doctorExtra = ' -AllowIncomplete' }
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'doctor.ps1') -ConfigPath $ConfigPath $doctorExtra

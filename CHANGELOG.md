@@ -1,4 +1,25 @@
-# 变更记录
+﻿# 变更记录
+
+> **版本记录说明（2026-11-24 补）**
+>
+> 本文件的详细条目只写到 **v0.3.4**；**v0.4.0 起的变更**（MySQL/SQLite 方言完善、`-Smart` 检索改写、
+> `VEC-CANDIDATE` 候选集、`MOOD` 情绪状态、FTS 两段、各机部署修复等）以 **GitHub Releases** 为准：
+> <https://github.com/dsh-xiaoyi/jiyijiushiguang/releases>
+>
+> 已知缺口（如实记录）：本文件缺 **v0.4.0 – v0.5.9** 条目；`jiyijiushiguang-mysql` 仓没有 CHANGELOG。
+> 后续发版请**先改本文件再打 tag**，并在 `ops\` 里加发布前断言（tag 必须有对应条目）。
+
+## 2026-11-24 修复摘要（索引，非版本条目）
+
+本批来自开源问题单（`OSS-ISSUES-20261124` 的 8 项，7 修 + 1 半），详细条目见 Releases（见上方说明）：
+
+- **MY-01** MySQL 排序规则：建库与比较的 collation 不一致导致查询失败 → 统一为 `utf8mb4_unicode_ci`
+- **MY-02** NUL 字符转义：文本含 `\0` 时转义顺序错、写入被截断 → 先转反斜杠再转 NUL
+- **SQ-01** SQLite 断点跨库：断点文件名未按库区分，多库共用会串 → 断点按库名分文件（`STATE-PERDB`）
+- **SQ-02** SQLite 大 session 卡死：临时表 `O(n²)` 关联 + 无 `busy_timeout` → 加索引 + 超时 + 收尾清理（实测 280s → 82s）
+- **IN-01** `install.ps1` 默认路径：`DSH_HOME` 自定义时路径不对 → 跟随 `DSH_HOME`
+- **IN-02** `doctor.ps1` 体检误报：主动精简安装被记 `FAIL` → 新增 `-AllowIncomplete`，记 `SKIP`
+- **DOC-01** CHANGELOG 缺口：如实声明本文件只写到 v0.3.4、v0.4.0 起以 Releases 为准（见文件顶部）
 
 ## v0.3.4 (2026-10-24) — 安装脚本支持三个后端 + 给智能体的说明
 
