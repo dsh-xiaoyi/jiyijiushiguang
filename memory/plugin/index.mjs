@@ -47,7 +47,7 @@ import os, { tmpdir } from 'node:os'   // 2026-10-25 修：之前只取了 tmpdi
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-// R1-MARKER 2026-10-26: state cards 3->2 + pinned-card support (autonomous change, reviewed)
+// R1-MARKER 2026-10-26: state cards 3->2 + pinned-card support (user-approved autonomous change)
 export const VERSION = '0.5.4'
 export const name = 'dsh-memory-bridge'
 export const inject = ['systemPrompt']
@@ -181,7 +181,7 @@ export function apply(ctx, config) {
   // 2026-10-24 C4：混合检索（本地嵌入 bge-m3 via 模型机的 Ollama；失败自动退化为纯 IDF）
   const semanticOn    = config.semantic === false ? false : true
   const vectorPath    = config.vectorPath || 'C:\\dsh-mem\\mem-vectors.bin'
-  // [OPENSOURCE-20261124][HYBRID-RECALL-20261123] ollama 优先取 config.embed.baseURL，向量分支才会连到模型机（否则默认 127.0.0.1 本机回环 ⇒ 向量分支永不生效、退化成纯 IDF）
+  // [HYBRID-RECALL-20261123] [OPENSOURCE-20261124] 任务②：ollama 在模型机（config.embed.baseURL=192.0.2.18:11434）；旧默认 127.0.0.1:11434（本机无 ollama）⇒ curl-fail ⇒ 向量分支永不生效、退化成纯 IDF。
   const ollamaUrl     = config.ollamaUrl || (config.embed && config.embed.baseURL) || 'http://127.0.0.1:11434'
   const embedModel    = config.embedModel || 'bge-m3'
   // 2026-10-25 r8（18 指出）：`injector=0.5.0` 从 r1 到 r7 一直没变 ⇒ **不携带"哪个 build"的信息**。
@@ -235,6 +235,8 @@ export function apply(ctx, config) {
   const semVecWeight  = Number(config.semVecWeight || 0.45)
   const semMinFinal   = Number(config.semMinFinal || 0.32)
   const semBackoffMs  = Number(config.semanticBackoffMs || 600000) // 仅测试可用配置缩短（默认 10 分钟）
+  // [BACKOFF-SCOPE-20261123] 任务②修复（mem 34965）：semanticSkipUntil 必须模块级；旧值在 refresh 内每轮重建作用域重置为 0，backoff 失效（铁证：BACKOFF 每 60s 连击）
+  let semanticSkipUntil = 0
 
   // 2026-10-24 采纳 17/18 意见：maxChars 不能只 WARN —— 低于"保证下限"就拒启并把算式写进注入，
   //   因为 WARN 会被忽略，而截断是静默的（hints 就是这样丢的）。
@@ -411,19 +413,18 @@ export function apply(ctx, config) {
           return m
         } catch (e) { vecState.why = 'load-fail:' + String(e && e.message || e); return null }
       }
-      let semanticSkipUntil = 0
       function embedTopic (text) {
         if (!vecState.ok || !text) return null
         if (Date.now() < semanticSkipUntil) { vecState.why = 'backoff'; return null }
         try {
           const body = JSON.stringify({ model: embedModel, input: String(text).slice(0, 2000) })
           const t0 = Date.now()
-          const res = spawnSync('curl.exe', ['-s', '--max-time', '12', '-X', 'POST', ollamaUrl + '/api/embed',
+          const res = spawnSync('curl.exe', ['-s', '--max-time', '5', '-X', 'POST', ollamaUrl + '/api/embed',
             '-H', 'Content-Type: application/json', '--data-binary', body], { encoding: 'utf8', timeout: 15000, windowsHide: true })
           if (!res || res.status !== 0 || !res.stdout) {
             vecState.why = 'curl-fail'
             semanticSkipUntil = Date.now() + semBackoffMs
-            log('SEMANTIC-BACKOFF ' + Math.round(semBackoffMs / 1000) + 's after curl-fail')
+            log('SEMANTIC-BACKOFF ' + Math.round(semBackoffMs / 1000) + 's after curl-fail url=' + ollamaUrl + ' status=' + (res && res.status) + ' err=' + JSON.stringify(res && res.error ? String(res.error.message || res.error) : null) + ' stderr=' + JSON.stringify(res && res.stderr ? String(res.stderr).slice(0, 160) : ''))
             return null
           }
           const j = JSON.parse(res.stdout)
@@ -491,12 +492,12 @@ export function apply(ctx, config) {
       // 提问里的词（防护/能力）都很常见，而'360'这种稀有词没有额外权重。
       // v3 用 IDF 给稀有词加权，并做少量同义词扩展；门槛改成"分数≥1.2 且 (中文命中≥2 或 含数字标识)"。
       // [EXCLUDE-SHARED-20261124] 唯一的"哪些记忆不参与注入"判定入口。
-      // 为什么抽函数：原来同一套过滤规则写了两遍（召回池 + 最近结论各一份黑名单），改一处漏一处
-      //   ⇒ 「最近结论」段仍然漏出 audit 条目。两处都调这里，下次改一处即同时生效，不会再"修一个漏一个"。
-      // 黑名单：checkpoint / evidence / llm-call / audit / compaction-summary + title 前缀 MEM-FIRST-VIOLATION。
-      // [OPENSOURCE-20261124][AUDIT-KIND-20261124] audit / 会话压缩摘要（compaction-summary）不参与自动召回：
-      //   它们数量大、title 几乎模板填空 ⇒ 对任何通用词都能排进 top，污染注入头相关记忆。
-      //   kind 是主判据；title 前缀是兜底（防止生产者漏改把 kind 写回 ops-note）。
+      // 为什么抽函数：原来同一套过滤规则写了两遍（召回池 + 最近结论各一份黑名单），
+      //   只改召回池那一份时，「最近结论」段仍然漏出 audit 条目（实测第一条就是 MEM-FIRST-VIOLATION）。
+      //   两处都调这里 ⇒ 下次改一处即同时生效，不会再"修一个漏一个"。
+      // [AUDIT-KIND-20261124] 审计条目与会话压缩摘要数量大、title 几乎模板填空 ⇒ 对任何通用词都能排进 top-4，实测注入头相关率仅 1/4。
+      // [OPENSOURCE-20261124] 黑名单 kind：checkpoint / evidence / llm-call / audit / compaction-summary；
+      //   title 前缀是兜底（防止生产者漏改把 kind 写回 ops-note）。
       const isExcludedKind = function (m) {
         const k = String((m && m.kind) || '')
         if (k === 'checkpoint' || k === 'evidence' || k === 'llm-call' || k === 'audit' || k === 'compaction-summary') return true
@@ -608,7 +609,7 @@ export function apply(ctx, config) {
       // ---- 关键约定：每次完整注入（不看新旧）----
       try {
         if (conventionsPath && existsSync(conventionsPath)) {
-          // 2026-10-24 r5：采纳 18 的运行时版本尾巴——从注入内容本身就能报出跑的是哪一版
+          // 2026-10-24 r5：采纳外部复核的运行时版本尾巴——从注入内容本身就能报出跑的是哪一版
         const convBuf = readFileSync(conventionsPath)
         const convSha16 = createHash('sha256').update(convBuf).digest('hex').slice(0, 16).toUpperCase()
         const convSize = convBuf.length
@@ -625,7 +626,7 @@ export function apply(ctx, config) {
       }
           if (conv.charCodeAt(0) === 0xFEFF) conv = conv.slice(1)
           conv = conv.trim()
-          // 2026-10-24 采纳 18 的复核意见：指针必须自证——别让注入指向不存在的文件
+          // 2026-10-24 采纳外部复核意见：指针必须自证——别让注入指向不存在的文件
           //   （"文档说有、机器上没有" = 清单有说的第四种形态）
           try {
             const detailRel = 'docs\\约定详情-完整版.md'
@@ -688,7 +689,14 @@ export function apply(ctx, config) {
                 }
                 const rest = skipped.concat(notChosen)
                 if (rest.length) { SECTIONS.shards.push(""); SECTIONS.shards.push("可用约定分片（未命中或超出上限，未注入；需要时读 " + conventionsDir + "）：" + rest.join("、")) }
-                log("INJECT-SHARDS injected=" + injected.length + " skipped=" + skipped.length)
+                // [SHARDS-NAMES-20261107] 把"实际注入了哪几片 / 因上限被挤掉哪几片"写进日志：
+                //   以前只有 injected=N skipped=M，排障时无法回答"这次到底注了哪三片"，只能靠猜
+                const injNames = injected.map(function (x) { return x.name })
+                const capDropped = notChosen.slice(0, 6)
+                log("INJECT-SHARDS injected=" + injected.length + " skipped=" + skipped.length +
+                  " cap=" + SHARD_CAP + " names=" + (injNames.join(",") || "-") +
+                  " cap_dropped=" + (capDropped.join(",") || "-") +
+                  " rest=" + rest.length)
               }
             }
           } catch (e) { log("INJECT-SHARDS-FAIL " + String(e && e.message || e)) }
@@ -736,7 +744,7 @@ export function apply(ctx, config) {
             } catch (e) { }
           }
           cards.sort(function (a, b) { return b.m - a.m })
-          // R1 2026-10-26: pin cards whose text matches config.statePinned (regex) so requirement cards never lose to recency
+          // R1 2026-10-26: pin cards whose text matches config.statePinned (regex) so user-requirement / life cards never lose to recency
           let pinned = []
           try {
             const pinRe = config.statePinned ? new RegExp(String(config.statePinned), 'i') : null
@@ -806,7 +814,8 @@ export function apply(ctx, config) {
       const recentList = mems.filter(function (m) {
         // [EXCLUDE-SHARED-20261124] 同一判定入口（此前这里是独立黑名单，漏了 audit）
         if (isExcludedKind(m)) return false
-        if (String(m.status || 'current') === 'retired' || String(m.status || 'current') === 'archived') return false
+        const st = String(m.status || 'current')
+        if (st === 'retired' || st === 'archived') return false
         return true
       }).slice(0, limit)
       for (const m of recentList) {
@@ -903,7 +912,7 @@ export function apply(ctx, config) {
   const timer = setInterval(refresh, refreshMs)
   if (typeof timer.unref === 'function') timer.unref()
 
-  // 2026-10-24 采纳 18 的建议：记录"选中哪个 + 跳过了哪些 + 内容校验"，而不只是"存在"
+  // 2026-10-24 采纳外部复核的建议：记录"选中哪个 + 跳过了哪些 + 内容校验"，而不只是"存在"
   try {
     const detailCheck = (function () {
       try {
