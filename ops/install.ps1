@@ -264,6 +264,8 @@ if ($RegisterTasks) {
 
 Say '5/5 体检'
 # [SKIP-NOT-FAIL-20261124] 主动跳过插件/副本时，体检按 SKIP 记，不判 FAIL
+# [PARAM-SPLAT-20261124] 用 splatting 传参：旧写法把 ' -AllowIncomplete' 当单个位置参数传入，
+#   撞 doctor 的 [int]$MaxReplicaMinutes ⇒ 带 -SkipPlugin/-SkipReplica 时体检报类型转换错
 $doctorArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $PSScriptRoot 'doctor.ps1'),'-ConfigPath',$ConfigPath)
 if ($SkipPlugin -or $SkipReplica) { $doctorArgs += '-AllowIncomplete' }
 & powershell @doctorArgs
