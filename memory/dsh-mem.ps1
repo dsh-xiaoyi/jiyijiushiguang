@@ -1101,8 +1101,13 @@ WHEN NOT MATCHED THEN INSERT (session_id, machine, cwd, title, event_count) VALU
   Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
 
   # remember what we imported so the next run can skip it
-  $script:State | Add-Member -NotePropertyName $SessionFile -NotePropertyValue $key -Force
-  Save-State
+  # [DRYRUN-NOOFFSET-20261124] DryRun 是探测，不该推进增量断点。
+  #   三方言版没有独立的 offsets 文件（未移植 INCREMENTAL 的 --from 解压），每会话断点就是 state 里的 "长度:mtime" 键
+  #   ⇒ DryRun 不写它，只打印 would-be；DB upsert 与归档在上面已经发生，所以 sync -DryRun 不是只读探测。
+  if (-not $DryRun) {
+    $script:State | Add-Member -NotePropertyName $SessionFile -NotePropertyValue $key -Force
+    Save-State
+  } else { Write-Host ("  [dry-run] checkpoint not saved (would be " + $key + ")") }
 
   Write-Host ("  session : $sid")
   Write-Host ("  title   : $sessTitle")
@@ -1714,8 +1719,11 @@ function Update-MoodDrift {
       'sqlite' { "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))" }
       default  { 'SYSUTCDATETIME()' }
     }
+    # [MOOD-SOFTTOP-20261124] boredom 天花板 1.0 -> 0.85：静默 8 小时会到 1.53，钳 1.0 等于"永远极度无聊"（语义失真）；
+    #   软顶 0.85 保留"很无聊"但不失真，且一有检索就 -0.02 回落。（这正是 0.0 反向对称问题）
+    #   三方言只改上限与注释：时间差写法 DATEDIFF / TIMESTAMPDIFF / julianday*1440 原样保留（见上面的 switch）。
     $sql = "UPDATE dbo.agent_state SET value = CASE state_name " +
-      "WHEN 'boredom' THEN CASE WHEN value + 0.002 * $minExpr - 0.02 * $Activity > 1.0 THEN 1.0 " +
+      "WHEN 'boredom' THEN CASE WHEN value + 0.002 * $minExpr - 0.02 * $Activity > 0.85 THEN 0.85 " +
       "WHEN value + 0.002 * $minExpr - 0.02 * $Activity < 0.10 THEN 0.10 " +
       "ELSE value + 0.002 * $minExpr - 0.02 * $Activity END " +
       "WHEN 'energy' THEN CASE WHEN value - 0.0001 * $minExpr - 0.001 * $minExpr + 0.02 * $Activity > 1.0 THEN 1.0 " +
@@ -1786,6 +1794,20 @@ if ($Command -match '^(sync|replica|save|backup)$') { Register-Host }
 switch ($Command.ToLower()) {
 
   'sync' {
+    # [FAILFAST-20261124] 启动即自检：缺 extractor / config 立即失败并给出非零退出码。
+    # 为什么：实测换目录后 extractor 缺失，sync 全部 FAILED，而 sync 行始终 exit=0 ⇒ 只能靠翻日志发现。
+    #   这里把"缺依赖"变成"立刻红"，不再静默。
+    if (-not (Test-Path -LiteralPath $cfg.extractor)) {
+      Write-Host ("  FAILFAST: extractor not found -> " + $cfg.extractor)
+      Write-Host ("            sync cannot decompress session logs. Fix: put dsh-zstd-extract.js next to this script, or set 'extractor' in dsh-mem.config.json")
+      exit 2
+    }
+    if (-not (Test-Path -LiteralPath $CfgPath)) {
+      Write-Host ("  FAILFAST: config not found -> " + $CfgPath); exit 2
+    }
+    if ($DryRun) {
+      Write-Host "  [WARN][DRYRUN-NOOFFSET-20261124] -DryRun only suppresses the per-session checkpoint write (dsh-mem-state.json); DB upserts and archiving STILL happen. Do not treat ""sync -DryRun"" as a read-only probe."
+    }
     if ($All) {
       $files = Get-ChildItem $cfg.sessionsRoot -Recurse -File -Force -ErrorAction SilentlyContinue |
                Where-Object { $_.Name -like '*.jsonl.zstd' }

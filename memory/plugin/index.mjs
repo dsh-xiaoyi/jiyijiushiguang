@@ -490,6 +490,20 @@ export function apply(ctx, config) {
       // v2 失败教训（2026-10-23）：阈值+长度归一 把"上周末 360 演练报告"挡掉了，因为
       // 提问里的词（防护/能力）都很常见，而'360'这种稀有词没有额外权重。
       // v3 用 IDF 给稀有词加权，并做少量同义词扩展；门槛改成"分数≥1.2 且 (中文命中≥2 或 含数字标识)"。
+      // [EXCLUDE-SHARED-20261124] 唯一的"哪些记忆不参与注入"判定入口。
+      // 为什么抽函数：原来同一套过滤规则写了两遍（召回池 + 最近结论各一份黑名单），改一处漏一处
+      //   ⇒ 「最近结论」段仍然漏出 audit 条目。两处都调这里，下次改一处即同时生效，不会再"修一个漏一个"。
+      // 黑名单：checkpoint / evidence / llm-call / audit / compaction-summary + title 前缀 MEM-FIRST-VIOLATION。
+      // [OPENSOURCE-20261124][AUDIT-KIND-20261124] audit / 会话压缩摘要（compaction-summary）不参与自动召回：
+      //   它们数量大、title 几乎模板填空 ⇒ 对任何通用词都能排进 top，污染注入头相关记忆。
+      //   kind 是主判据；title 前缀是兜底（防止生产者漏改把 kind 写回 ops-note）。
+      const isExcludedKind = function (m) {
+        const k = String((m && m.kind) || '')
+        if (k === 'checkpoint' || k === 'evidence' || k === 'llm-call' || k === 'audit' || k === 'compaction-summary') return true
+        if (/^MEM-FIRST-VIOLATION\s/.test(String((m && m.title) || ''))) return true
+        return false
+      }
+
       if (autoRecall) {
         try {
           const NOISE = ['Current runtime context', '[bridge msg', 'Agent ', 'Background subagent', 'This is an automatically generated', '[SCHEDULE', '<goal_', 'Time sampled while preparing']
@@ -523,12 +537,8 @@ export function apply(ctx, config) {
           const kwList = Array.from(kws)
           if (kwList.length) {
             const pool = mems.filter(function (m) {
-              // [OPENSOURCE-20261124][AUDIT-KIND-20261124] 审计条目（MEM-FIRST-VIOLATION）与会话压缩摘要不参与自动召回：
-              //   它们数量大、title 几乎模板填空 ⇒ 对任何通用词都能排进 top，污染注入头相关记忆。
-              //   kind 是主判据；title 前缀是兜底（防止生产者漏改把 kind 写回 ops-note）。
-              const __kind = String(m.kind || '')
-              if (__kind === 'checkpoint' || __kind === 'evidence' || __kind === 'llm-call' || __kind === 'audit' || __kind === 'compaction-summary') return false
-              if (/^MEM-FIRST-VIOLATION\s/.test(String(m.title || ''))) return false
+              // [EXCLUDE-SHARED-20261124] 共用判定（见 isExcludedKind）
+              if (isExcludedKind(m)) return false
               if (String(m.status || 'current') === 'retired' || String(m.status || 'current') === 'archived') return false
               if (String(m.body || '').length > 200000) return false // 2026-10-24: 原来 >6000 直接跳过=静默丢失；只挡 20 万字符以上的极端情况
               return true
@@ -794,10 +804,9 @@ export function apply(ctx, config) {
       SECTIONS.recent.push('### 最近结论（新 → 旧）')
       // 2026-10-24 C3：最近结论同样跳过 evidence/checkpoint；status 非 current 的加标注，便于"别引用旧结论"
       const recentList = mems.filter(function (m) {
-        const k = String(m.kind || '')
-        const st = String(m.status || 'current')
-        if (k === 'checkpoint' || k === 'evidence' || k === 'llm-call') return false
-        if (st === 'retired' || st === 'archived') return false
+        // [EXCLUDE-SHARED-20261124] 同一判定入口（此前这里是独立黑名单，漏了 audit）
+        if (isExcludedKind(m)) return false
+        if (String(m.status || 'current') === 'retired' || String(m.status || 'current') === 'archived') return false
         return true
       }).slice(0, limit)
       for (const m of recentList) {
