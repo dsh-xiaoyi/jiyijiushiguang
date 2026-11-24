@@ -517,7 +517,13 @@ function ConvertTo-SqliteRows {
   param([string[]]$RawLines)
   $txt = ((@($RawLines) | Where-Object { $_ -ne $null }) -join "`n").Trim()
   if (-not $txt) { return @() }
-  $start = $txt.LastIndexOf('[')
+  # [SQLITE-JSON-ARRAY-20261124] sqlite3 -json 的输出整体就是一个 JSON 数组，必然从第 0 列开始。
+  #   原实现用 $txt.LastIndexOf('[') 找数组开头 —— 一旦**结果数据里含 '['**（实测本机 13,613/21,502 条
+  #   消息正文含 '['，占 63%），LastIndexOf 会命中数据里的那个 '['，截出 "[pwsh] hello\"}]" 这种坏 JSON，
+  #   ConvertFrom-Json 抛异常 → catch 返回空数组 → 上层以为"0 命中"。
+  #   ⇒ search 对含 '[' 的消息永远查不到（静默丢结果，最难看的一种 bug）。
+  #   改用第一个 '['：单条 SELECT 的数组一定在开头；多语句场景由调用方保证只取一条 SELECT。
+  $start = $txt.IndexOf('[')
   if ($start -lt 0) { return @() }
   try { $arr = $txt.Substring($start) | ConvertFrom-Json } catch { return @() }
   if ($null -eq $arr) { return @() }
@@ -1268,7 +1274,12 @@ function Invoke-MemoryFts {
     'sqlite'  { "SELECT m.id, m.created_at, m.scope, m.subject, m.kind, m.title, m.tags, m.body FROM memories_fts JOIN memories m ON m.id = memories_fts.rowid WHERE memories_fts MATCH @fts ORDER BY m.access_count DESC, m.updated_at DESC LIMIT @n" }
     default   { "SELECT TOP (@n) m.id, m.created_at, m.scope, m.subject, m.kind, m.title, m.tags, m.body FROM FREETEXTTABLE(dbo.memories, (title, body, tags), @fts) ct JOIN dbo.memories m ON m.id = ct.[KEY] ORDER BY ct.RANK DESC, m.access_count DESC, m.updated_at DESC" }
   }
-  $r = Invoke-Rows -Sql $sql -Params @{ '@n' = $Limit; '@fts' = $Target }
+  # [FTS-PHRASE-20261124] SQLite 的 FTS5 把 - / % / * 当查询语法：
+  #   MATCH 'dsh-mem-state' → "no such column: mem"（- 被当 NOT）；MATCH '100%' → "syntax error near %"
+  #   必须包成双引号短语：MATCH '"dsh-mem-state"'（实测 55 行）/ MATCH '"100%"'（实测 1,077 行）
+  $ftsArg = $Target
+  if ($script:Provider -eq 'sqlite') { $ftsArg = '"' + ($Target -replace '"', '""') + '"' }
+  $r = Invoke-Rows -Sql $sql -Params @{ '@n' = $Limit; '@fts' = $ftsArg }
   return $r
 }
 
@@ -1282,7 +1293,12 @@ function Invoke-MessageFtsCandidates {
     'sqlite'  { "SELECT m.id, m.session_id, m.seq, m.role, m.created_at, m.text FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid WHERE messages_fts MATCH @fts ORDER BY m.created_at DESC LIMIT @n" }
     default   { "SELECT TOP (@n) m.id, m.session_id, m.seq, m.role, m.created_at, m.text FROM FREETEXTTABLE(dbo.messages, (text), @fts) ft JOIN dbo.messages m ON m.id = ft.[KEY] ORDER BY ft.RANK DESC, m.created_at DESC" }
   }
-  $r = Invoke-Rows -Sql $sql -Params @{ '@n' = $Limit; '@fts' = $Target }
+  # [FTS-PHRASE-20261124] SQLite 的 FTS5 把 - / % / * 当查询语法：
+  #   MATCH 'dsh-mem-state' → "no such column: mem"（- 被当 NOT）；MATCH '100%' → "syntax error near %"
+  #   必须包成双引号短语：MATCH '"dsh-mem-state"'（实测 55 行）/ MATCH '"100%"'（实测 1,077 行）
+  $ftsArg = $Target
+  if ($script:Provider -eq 'sqlite') { $ftsArg = '"' + ($Target -replace '"', '""') + '"' }
+  $r = Invoke-Rows -Sql $sql -Params @{ '@n' = $Limit; '@fts' = $ftsArg }
   return $r
 }
 
