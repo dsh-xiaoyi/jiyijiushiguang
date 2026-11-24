@@ -13,7 +13,7 @@
 
 本批来自开源问题单（`OSS-ISSUES-20261124` 的 8 项，7 修 + 1 半），详细条目见 Releases（见上方说明）：
 
-- **MY-01** MySQL 排序规则：建库与比较的 collation 不一致导致查询失败 → 统一为 `utf8mb4_unicode_ci`
+- **MY-01** MySQL 排序规则：建库与比较的 collation 不一致导致查询失败 → 统一为 `utf8mb4_general_ci`
 - **MY-02** NUL 字符转义：文本含 `\0` 时转义顺序错、写入被截断 → 先转反斜杠再转 NUL
 - **SQ-01** SQLite 断点跨库：断点文件名未按库区分，多库共用会串 → 断点按库名分文件（`STATE-PERDB`）
 - **SQ-02** SQLite 大 session 卡死：临时表 `O(n²)` 关联 + 无 `busy_timeout` → 加索引 + 超时 + 收尾清理（实测 280s → 82s）
