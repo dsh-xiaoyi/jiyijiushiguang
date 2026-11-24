@@ -835,7 +835,12 @@ function Invoke-Sync {
   param([string]$SessionFile)
 
   if (-not (Test-Path -LiteralPath $SessionFile)) { throw "session file not found: $SessionFile" }
-  if (-not (Test-Path -LiteralPath $cfg.node))      { throw "node not found: $($cfg.node)" }
+  # [NODE-GUARD-20261124] cfg.node 可能为空（node 不在 PATH、也没配 node 字段）：
+  #   原实现直接 Test-Path -LiteralPath $cfg.node ⇒ 报 "Cannot bind argument to parameter 'LiteralPath' because it is null"
+  #   这种报错完全看不出"是缺 node"，现场会被误导成路径/权限问题。
+  if (-not $cfg.node) { throw ("node not found: 请在配置里写 ""node"": ""<node.exe 全路径>""，或把 node 加入 PATH（sync 需要它跑解压器 dsh-zstd-extract.js）") }
+  if (-not (Test-Path -LiteralPath $cfg.node)) { throw ("node not found at: " + $cfg.node) }
+  if (-not $cfg.extractor) { throw ("extractor not found: 请在配置里写 ""extractor""，或把 dsh-zstd-extract.js 放到引擎同目录") }
   if (-not (Test-Path -LiteralPath $cfg.extractor)) { throw "extractor not found: $($cfg.extractor)" }
 
   # [TEMP-CLEANUP-20261124] 进程被强杀/超时时 finally 不执行 ⇒ 临时 JSONL 残留

@@ -84,6 +84,11 @@ function New-Config {
     $cfg.replicaPath = ($existing.replicaPath)
     if (-not $cfg.replicaPath) { $cfg.replicaPath = (Join-Path (Split-Path $ConfigPath -Parent) 'dsh-mem-replica.json') }
     $cfg.sessionsRoot = $SessionsRoot
+    # [NODE-SET-20261124] 把 node 路径写进配置：否则 sync 阶段引擎找不到 node
+    #   （node 不在 PATH 时会报 cryptic 的 "Cannot bind ... 'LiteralPath' ... null"，看不出是缺 node）
+    $nodeHit = Get-Command node -ErrorAction SilentlyContinue
+    if ($nodeHit) { $cfg.node = $nodeHit.Source }
+    elseif ($existing.node) { $cfg.node = $existing.node }
     switch ($Provider) {
         'sqlserver' {
             $cfg.server   = $SqlServer
@@ -259,6 +264,6 @@ if ($RegisterTasks) {
 
 Say '5/5 体检'
 # [SKIP-NOT-FAIL-20261124] 主动跳过插件/副本时，体检按 SKIP 记，不判 FAIL
-$doctorExtra = ''
-if ($SkipPlugin -or $SkipReplica) { $doctorExtra = ' -AllowIncomplete' }
-& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'doctor.ps1') -ConfigPath $ConfigPath $doctorExtra
+$doctorArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $PSScriptRoot 'doctor.ps1'),'-ConfigPath',$ConfigPath)
+if ($SkipPlugin -or $SkipReplica) { $doctorArgs += '-AllowIncomplete' }
+& powershell @doctorArgs
