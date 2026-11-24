@@ -110,7 +110,16 @@ function Read-TextFile([string]$Path) {
 }
 
 $Root    = Split-Path -Parent $MyInvocation.MyCommand.Path
-$CfgPath = Join-Path $Root 'dsh-mem.config.json'
+# [CFG-ENV-PRIORITY-20261124] 环境变量 DSH_MEM_CONFIG 必须**优先**于"脚本旁边的配置"。
+#   原实现：$CfgPath 先取 $Root\dsh-mem.config.json，只有它不存在才去试 $env:DSH_MEM_CONFIG
+#   ⇒ 一旦装过生产配置，把 DSH_MEM_CONFIG 指向测试库/另一个库**完全不生效**，引擎照样连生产。
+#   实测踩坑：用 DSH_MEM_CONFIG 指 mysql 测试配置跑 search，结果打到了生产库（本机默认主机）/DSHMemory。
+#   这也让 install.ps1 用 -ConfigPath 装到自定义库时，doctor 里引擎那一步仍读生产配置。
+$CfgPath = if ($env:DSH_MEM_CONFIG -and (Test-Path -LiteralPath $env:DSH_MEM_CONFIG)) {
+    $env:DSH_MEM_CONFIG
+} else {
+    Join-Path $Root 'dsh-mem.config.json'
+}
 # 配置查找兜底（开源版：不要求用户把配置放在脚本旁边）
 if (-not (Test-Path -LiteralPath $CfgPath)) {
     $candidates = @(
@@ -1800,21 +1809,19 @@ function Update-MoodDrift {
 function Invoke-SmartRewrite {
   # [OPENSOURCE-20261124][SMART-REWRITE-20261123] 口语<->术语改写：主 deepseek-chat，备火山方舟 deepseek-v4-1-flash。
   #   改写失败（主备都挂 / 无密钥）返回 $null，调用方回退原字面检索，绝不阻断 search。
-  #   说明：密钥读自 dbo.credentials（SQL Server）；非 SQL Server 后端连接失败 => 静默回退原检索。
   param([string]$Text)
   try {
-    $csx = "Server=$($cfg.server);Database=$($cfg.database);User Id=$($cfg.user);Password=$($cfg.password);Encrypt=False;TrustServerCertificate=True;Connect Timeout=15"
-    $cnx = New-Object System.Data.SqlClient.SqlConnection $csx
-    $cnx.Open()
-    $cmdx = $cnx.CreateCommand()
-    $cmdx.CommandText = "SELECT name, secret FROM dbo.credentials WHERE is_active=1 AND name IN ('deepseek-api-key-2026-10','volc-ark-doubao-v2');"
-    $rdx = $cmdx.ExecuteReader()
+    # [SMART-PROVIDER-AGNOSTIC-20261124] 密钥读取改走 provider 抽象（Invoke-Rows）。
+    #   原实现硬连 System.Data.SqlClient：
+    #     · MySQL / SQLite 后端连不上 ⇒ -Smart 永远用不上（注释还写着"静默回退"，实际是功能缺失）；
+    #     · 每次 search -Smart 都要白等 15 秒连接超时。
+    #   现在三方言统一读 credentials 表（dbo. 前缀由 ConvertTo-SqliteSql / ConvertTo-MySqlSql 去掉）。
+    $credRows = Invoke-Rows -Sql "SELECT name, secret FROM dbo.credentials WHERE is_active = 1 AND name IN ('deepseek-api-key-2026-10','volc-ark-doubao-v2')"
     $keyDs = ''; $keyVolc = ''
-    while ($rdx.Read()) {
-      if ($rdx['name'] -eq 'deepseek-api-key-2026-10') { $keyDs = [string]$rdx['secret'] }
-      elseif ($rdx['name'] -eq 'volc-ark-doubao-v2') { $keyVolc = [string]$rdx['secret'] }
+    foreach ($cr in @($credRows)) {
+      if ([string]$cr.name -eq 'deepseek-api-key-2026-10') { $keyDs = [string]$cr.secret }
+      elseif ([string]$cr.name -eq 'volc-ark-doubao-v2') { $keyVolc = [string]$cr.secret }
     }
-    $rdx.Close(); $cnx.Close()
     if (-not $keyDs -and -not $keyVolc) { Write-Host '  [SMART] FAIL: 主备密钥都读不到'; return $null }
     $prompt = '把下面的口语问题改写成 3~6 个检索关键词（术语化、同义词展开、空格分隔，只输出关键词本身，不要解释、不要标点）：' + $Text
     $bodyObj = @{ model = 'deepseek-chat'; messages = @(@{ role = 'user'; content = $prompt }); temperature = 0.2 } | ConvertTo-Json -Depth 6
@@ -2002,7 +2009,11 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf, CASE WHEN @v
       $arIds = @($m | ForEach-Object { [int64]$_.id })
       if ($arIds.Count -gt 0) { $null = Invoke-Exec -Sql ("UPDATE dbo.memories SET access_count = access_count + 1, last_injected_at = SYSUTCDATETIME() WHERE id IN (" + ($arIds -join ',') + ")") }
       # [CO-OCCUR-20261119] 共现互链：同一次查询同时命中的记忆，两两记一条共现边、weight+1
-      Invoke-CoOccur -HitIds $arIds
+      # [COOCCUR-TOLERANT-20261124] 共现互链是"记账"性质（回忆重建用）：
+      #   本机 dsh_mem_01 对 dbo.memory_refs 无 SELECT/INSERT/UPDATE 权限时，
+      #   原实现会让整个 search 抛异常中断 —— 检索结果才是主线，记账失败不该拖垮它。
+      try { Invoke-CoOccur -HitIds $arIds }
+      catch { Write-Host ('  [WARN] co-occur skipped: ' + $_.Exception.Message.Split("`n")[0]) }
       if (@($m).Count -eq 0) { Write-Host "  (none)" }
       foreach ($r in @($m)) {
         Write-Host ("  [{0}] {1} {2}/{3} {4}  {5}" -f $r.id, $r.created_at.ToLocalTime().ToString('MM-dd HH:mm'), $r.scope, $r.subject, $r.kind, $r.title)
